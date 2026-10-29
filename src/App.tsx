@@ -1,10 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
     Star, Store, ShieldCheck, Moon, Sun, 
     Settings, MapPin, Inbox, Type, KeyRound, 
     LogOut, Trash2, Copy, ExternalLink, 
     MessageSquare, Check, AlertTriangle, PhoneCall, Link as LinkIcon, QrCode, X, Eye, Plus
 } from 'lucide-react';
+import {
+    defaultConfig,
+    isFirebaseReady,
+    saveAppConfig,
+    saveFeedback,
+    subscribeAppConfig,
+    subscribeFeedbacks,
+    updateFeedback,
+    deleteFeedbackById,
+    type AppConfig,
+} from './firebase';
 
 // --- TIPE DATA ---
 type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive';
@@ -48,6 +59,22 @@ interface PageSettings {
     thanksButtonText: string;
 }
 
+const serializeAppConfig = (config: AppConfig): string => {
+    const normalize = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(normalize);
+        if (value !== null && typeof value === 'object') {
+            return Object.fromEntries(
+                Object.entries(value)
+                    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+                    .map(([key, nestedValue]) => [key, normalize(nestedValue)])
+            );
+        }
+        return value;
+    };
+
+    return JSON.stringify(normalize(config)) ?? '';
+};
+
 export default function App() {
     // --- STATE THEME ---
     const [isDarkMode, setIsDarkMode] = useState(false);
@@ -65,47 +92,106 @@ export default function App() {
     const [userRole, setUserRole] = useState<UserRole | null>(null);
 
     // --- STATE KONFIGURASI ADMIN ---
-    const [appConfig, setAppConfig] = useState({
-        adminPin: '1234',
-        branches: [
-            {
-                id: 'UTAMA1',
-                name: 'Cabang Utama (Pusat)',
-                publicAppUrl: "https://toko-anda.com/feedback?branch=UTAMA1",
-                reviewUrl: "https://g.page/r/example/review",
-                qrColor: "#4F46E5",
-                qrBgColor: "#FFFFFF",
-                pin: '1111',
-                isActive: true,
-                adminWhatsapp: "6281234567890"
+    const [appConfig, setAppConfig] = useState<AppConfig>(defaultConfig);
+    const [isConfigLoading, setIsConfigLoading] = useState(isFirebaseReady);
+    const [hasLoadedConfig, setHasLoadedConfig] = useState(false);
+    const [configLoadError, setConfigLoadError] = useState('');
+    const [configSaveStatus, setConfigSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const [configSyncError, setConfigSyncError] = useState('');
+    const [adminPinDraft, setAdminPinDraft] = useState(defaultConfig.adminPin);
+    const [pinSaveStatus, setPinSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const [pinSaveMessage, setPinSaveMessage] = useState('');
+    const lastPersistedConfigRef = useRef<string | null>(null);
+    const queuedConfigJsonRef = useRef<string | null>(null);
+    const configWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const pendingConfigWritesRef = useRef(0);
+
+    const persistAppConfig = useCallback((config: AppConfig): Promise<void> => {
+        if (!isFirebaseReady) return Promise.reject(new Error('Firebase belum dikonfigurasi.'));
+
+        const serializedConfig = serializeAppConfig(config);
+        if (serializedConfig === queuedConfigJsonRef.current) return Promise.resolve();
+
+        queuedConfigJsonRef.current = serializedConfig;
+        pendingConfigWritesRef.current += 1;
+        setConfigSaveStatus('saving');
+        setConfigSyncError('');
+
+        const pendingWrite = configWriteQueueRef.current
+            .catch(() => undefined)
+            .then(async () => {
+                if (serializedConfig === lastPersistedConfigRef.current) return;
+                await saveAppConfig(config);
+                lastPersistedConfigRef.current = serializedConfig;
+            })
+            .then(
+                () => {
+                    pendingConfigWritesRef.current -= 1;
+                    if (pendingConfigWritesRef.current === 0) setConfigSaveStatus('saved');
+                },
+                (error: unknown) => {
+                    pendingConfigWritesRef.current -= 1;
+                    if (queuedConfigJsonRef.current === serializedConfig) {
+                        queuedConfigJsonRef.current = lastPersistedConfigRef.current;
+                    }
+                    if (pendingConfigWritesRef.current === 0) {
+                        setConfigSaveStatus('error');
+                        setConfigSyncError('Pengaturan gagal disimpan ke Firebase.');
+                    }
+                    throw error;
+                }
+            );
+
+        configWriteQueueRef.current = pendingWrite.then(() => undefined, () => undefined);
+        return pendingWrite;
+    }, []);
+
+    useEffect(() => {
+        if (!isFirebaseReady) return;
+        setIsConfigLoading(true);
+        return subscribeAppConfig(
+            (config) => {
+                const nextConfig = config ?? defaultConfig;
+                const serializedConfig = config ? serializeAppConfig(config) : null;
+                if (pendingConfigWritesRef.current === 0) {
+                    lastPersistedConfigRef.current = serializedConfig;
+                    queuedConfigJsonRef.current = serializedConfig;
+                    setAppConfig(nextConfig);
+                    setConfigSaveStatus(config ? 'saved' : 'idle');
+                } else if (serializedConfig !== null && serializedConfig === queuedConfigJsonRef.current) {
+                    lastPersistedConfigRef.current = serializedConfig;
+                    setAppConfig(nextConfig);
+                }
+                setHasLoadedConfig(true);
+                setIsConfigLoading(false);
+                setConfigLoadError('');
+                setConfigSyncError('');
             },
-            {
-                id: 'CABANG2',
-                name: 'Cabang Baru (Belum Aktif)',
-                publicAppUrl: "https://toko-anda.com/feedback?branch=CABANG2",
-                reviewUrl: "",
-                qrColor: "#4F46E5",
-                qrBgColor: "#FFFFFF",
-                pin: '2222',
-                isActive: false,
-                adminWhatsapp: "6281234567890"
+            () => {
+                setIsConfigLoading(false);
+                setConfigLoadError('Konfigurasi aplikasi gagal dimuat dari Firebase.');
             }
-        ] as Branch[],
-        pageSettings: {
-            title: "Halo! 👋",
-            subtitle: "Cerita luar biasa Anda adalah penyambung nyawa bisnis kami. Berikan 5 bintang terbaik anda",
-            positiveTitle: "Kami Senang Anda Puas! 🎉",
-            positiveText: "Selangkah lagi untuk Sempurnakan momen luar biasa anda hari ini, untuk menginspirasi dunia di Google",
-            positiveButtonText: "Beri Ulasan di Google",
-            negativeTitle: "Mohon Maaf Atas Ketidaknyamanan Ini",
-            negativeText: "Bantu kami menjadi lebih baik. Ceritakan apa yang kurang memuaskan dari layanan kami.",
-            negativePlaceholder: "Ketik masukan Anda di sini...",
-            negativeButtonText: "Kirim Masukan",
-            thanksTitle: "Terima Kasih!",
-            thanksText: "Masukan Anda telah kami terima dan akan langsung diteruskan ke tim manajemen kami.",
-            thanksButtonText: "Selesai"
-        } as PageSettings
-    });
+        );
+    }, []);
+
+    useEffect(() => {
+        if (!isFirebaseReady || !hasLoadedConfig || isConfigLoading || configLoadError) return;
+        const serializedConfig = serializeAppConfig(appConfig);
+        if (serializedConfig === queuedConfigJsonRef.current) {
+            if (pendingConfigWritesRef.current === 0) setConfigSaveStatus('saved');
+            return;
+        }
+
+        setConfigSaveStatus('saving');
+        const timeoutId = window.setTimeout(() => {
+            void persistAppConfig(appConfig).catch(() => undefined);
+        }, 500);
+        return () => window.clearTimeout(timeoutId);
+    }, [appConfig, hasLoadedConfig, isConfigLoading, configLoadError, persistAppConfig]);
+
+    useEffect(() => {
+        setAdminPinDraft(appConfig.adminPin);
+    }, [appConfig.adminPin]);
 
     const [selectedBranchIndex, setSelectedBranchIndex] = useState(0);
     const [showQrModal, setShowQrModal] = useState(false);
@@ -150,25 +236,29 @@ export default function App() {
         }
     }, [currentClientBranchId, clientBranch]);
     
-    // --- STATE DUMMY DATA FEEDBACK ---
-    const [feedbacks, setFeedbacks] = useState<Feedback[]>([
-        {
-            id: 'fb-1',
-            branchId: 'UTAMA1',
-            rating: 5,
-            message: 'Pelayanan sangat ramah dan tempatnya bersih sekali!',
-            date: new Date(Date.now() - 86400000).toISOString(),
-            status: 'resolved'
-        },
-        {
-            id: 'fb-2',
-            branchId: 'UTAMA1',
-            rating: 2,
-            message: 'Parkiran terlalu sempit dan antrian cukup lama.',
-            date: new Date().toISOString(),
-            status: 'new'
-        }
-    ]);
+    // --- DATA ULASAN REAL-TIME ---
+    const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
+    const [isFeedbackLoading, setIsFeedbackLoading] = useState(isFirebaseReady);
+    const [feedbackSyncError, setFeedbackSyncError] = useState('');
+    const [feedbackSubmitError, setFeedbackSubmitError] = useState('');
+    const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
+
+    useEffect(() => {
+        if (!isFirebaseReady) return;
+        setIsFeedbackLoading(true);
+        return subscribeFeedbacks(
+            (items) => {
+                setFeedbacks(items);
+                setSelectedFeedbackModal((current) => current ? items.find((item) => item.id === current.id) ?? null : null);
+                setIsFeedbackLoading(false);
+                setFeedbackSyncError('');
+            },
+            () => {
+                setIsFeedbackLoading(false);
+                setFeedbackSyncError('Data ulasan gagal dimuat dari Firebase.');
+            }
+        );
+    }, []);
 
     const ratingDescriptions = [
         "",
@@ -189,20 +279,36 @@ export default function App() {
         }
     };
 
-    const submitFeedback = () => {
-        if (!feedbackText.trim()) return;
-        
-        const newFeedback: Feedback = {
-            id: `fb-${Date.now()}`,
+    const submitFeedback = async () => {
+        const message = feedbackText.trim();
+        if (!message || isSubmittingFeedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSubmitError('Firebase belum dikonfigurasi, jadi ulasan belum dapat disimpan.');
+            return;
+        }
+
+        const feedbackData = {
             branchId: clientBranch.id,
             rating: selectedRating,
-            message: feedbackText,
+            message,
             date: new Date().toISOString(),
-            status: 'new'
+            status: 'new' as const,
         };
-        
-        setFeedbacks([newFeedback, ...feedbacks]);
-        setView('thanks');
+
+        setFeedbackSubmitError('');
+        setIsSubmittingFeedback(true);
+        try {
+            const id = await saveFeedback(feedbackData);
+            const newFeedback: Feedback = { ...feedbackData, id };
+            setFeedbacks((current) => current.some((item) => item.id === id) ? current : [newFeedback, ...current]);
+            setFeedbackText('');
+            setView('thanks');
+        } catch {
+            setFeedbackSubmitError('Ulasan gagal dikirim ke Firebase. Periksa koneksi dan coba lagi.');
+            setFeedbackSyncError('Ulasan gagal disimpan ke Firebase.');
+        } finally {
+            setIsSubmittingFeedback(false);
+        }
     };
 
     const resetClientView = () => {
@@ -287,7 +393,7 @@ export default function App() {
                 setAdminTab('feedback'); 
                 setAdminPinInput('');
             } else {
-                alert('PIN Salah! Gunakan 1234 untuk Superadmin, atau PIN Toko yang terdaftar.');
+                alert('PIN salah. Periksa kembali PIN Admin atau PIN Toko yang terdaftar.');
             }
         }
     };
@@ -389,17 +495,80 @@ export default function App() {
         });
     };
 
-    const toggleFeedbackStatus = (id: string) => {
-        setFeedbacks(feedbacks.map(fb => fb.id === id ? { ...fb, status: fb.status === 'new' ? 'resolved' : 'new' } : fb));
-        if (selectedFeedbackModal && selectedFeedbackModal.id === id) {
-            setSelectedFeedbackModal(prev => prev ? { ...prev, status: prev.status === 'new' ? 'resolved' : 'new' } : null);
+    const handleSaveAdminPin = async () => {
+        const nextAdminPin = adminPinDraft.trim();
+        if (!/^\d{4,8}$/.test(nextAdminPin)) {
+            setPinSaveStatus('error');
+            setPinSaveMessage('PIN harus terdiri dari 4 sampai 8 digit angka.');
+            return;
+        }
+        if (!isFirebaseReady) {
+            setPinSaveStatus('error');
+            setPinSaveMessage('Firebase belum dikonfigurasi. PIN belum disimpan.');
+            return;
+        }
+        if (isConfigLoading || configLoadError) return;
+
+        const nextConfig = { ...appConfig, adminPin: nextAdminPin };
+        setPinSaveStatus('saving');
+        setPinSaveMessage('');
+
+        try {
+            await persistAppConfig(nextConfig);
+            setAppConfig(nextConfig);
+            setPinSaveStatus('saved');
+            setPinSaveMessage('PIN Superadmin berhasil disimpan dan tersinkron ke Firebase.');
+        } catch {
+            setPinSaveStatus('error');
+            setPinSaveMessage('PIN gagal disimpan. Periksa akses Firestore, lalu coba lagi.');
         }
     };
 
-    const deleteFeedback = (id: string) => {
-        setFeedbacks(feedbacks.filter(fb => fb.id !== id));
-        if (selectedFeedbackModal && selectedFeedbackModal.id === id) {
-            setSelectedFeedbackModal(null);
+    const toggleFeedbackStatus = async (id: string) => {
+        const feedback = feedbacks.find((item) => item.id === id);
+        if (!feedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSyncError('Firebase belum dikonfigurasi. Status ulasan tidak dapat disimpan.');
+            return;
+        }
+
+        const nextStatus = feedback.status === 'new' ? 'resolved' : 'new';
+        setFeedbacks((current) => current.map((item) => item.id === id ? { ...item, status: nextStatus } : item));
+        setSelectedFeedbackModal((current) => current?.id === id ? { ...current, status: nextStatus } : current);
+
+        try {
+            await updateFeedback(id, { status: nextStatus });
+            setFeedbackSyncError('');
+        } catch {
+            setFeedbacks((current) => current.map((item) => item.id === id ? { ...item, status: feedback.status } : item));
+            setSelectedFeedbackModal((current) => current?.id === id ? { ...current, status: feedback.status } : current);
+            setFeedbackSyncError('Status ulasan gagal disimpan ke Firebase.');
+        }
+    };
+
+    const deleteFeedback = async (id: string) => {
+        const feedbackIndex = feedbacks.findIndex((item) => item.id === id);
+        const feedback = feedbacks[feedbackIndex];
+        if (!feedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSyncError('Firebase belum dikonfigurasi. Ulasan tidak dapat dihapus.');
+            return;
+        }
+
+        setFeedbacks((current) => current.filter((item) => item.id !== id));
+        setSelectedFeedbackModal((current) => current?.id === id ? null : current);
+
+        try {
+            await deleteFeedbackById(id);
+            setFeedbackSyncError('');
+        } catch {
+            setFeedbacks((current) => {
+                if (current.some((item) => item.id === id)) return current;
+                const restored = [...current];
+                restored.splice(Math.min(feedbackIndex, restored.length), 0, feedback);
+                return restored;
+            });
+            setFeedbackSyncError('Ulasan gagal dihapus dari Firebase.');
         }
     };
 
@@ -444,6 +613,35 @@ export default function App() {
                             {userRole === 'superadmin' ? 'Admin Dashboard Utama' : `Panel Toko: ${activeBranch.name}`}
                         </h2>
                         <p className="text-xs text-gray-500 dark:text-gray-400">Kelola operasional dan ulasan pelanggan secara terpusat</p>
+                        <p
+                            role="status"
+                            aria-live="polite"
+                            className={`mt-1 text-xs ${!isFirebaseReady || configLoadError || configSyncError || feedbackSyncError ? 'text-amber-600 dark:text-amber-400' : configSaveStatus === 'saving' || isConfigLoading || isFeedbackLoading ? 'text-indigo-600 dark:text-indigo-400' : 'text-emerald-600 dark:text-emerald-400'}`}
+                        >
+                            {!isFirebaseReady
+                                ? 'Firebase belum dikonfigurasi — data dan pengaturan tidak tersinkron.'
+                                : configLoadError || configSyncError || feedbackSyncError
+                                    ? 'Sinkronisasi Firebase bermasalah.'
+                                    : isConfigLoading || isFeedbackLoading
+                                        ? 'Menghubungkan ke Firebase...'
+                                        : configSaveStatus === 'saving'
+                                            ? 'Menyinkronkan data dan pengaturan...'
+                                            : 'Data dan pengaturan tersinkron dengan Firebase.'}
+                        </p>
+                        {(configLoadError || configSyncError || feedbackSyncError) && (
+                            <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
+                                {configLoadError || configSyncError || feedbackSyncError}
+                            </p>
+                        )}
+                        {configSaveStatus === 'error' && (
+                            <button
+                                type="button"
+                                onClick={() => { void persistAppConfig(appConfig).catch(() => undefined); }}
+                                className="mt-1 text-xs font-medium text-indigo-600 underline dark:text-indigo-400"
+                            >
+                                Coba simpan pengaturan lagi
+                            </button>
+                        )}
                     </div>
                 </div>
                 <div className="flex flex-wrap gap-2 w-full md:w-auto items-center">
@@ -738,7 +936,14 @@ export default function App() {
                                 <MessageSquare className="w-5 h-5 text-indigo-500" /> Kotak Masuk Ulasan: {activeBranch.name}
                             </h3>
                             
-                            {feedbacks.filter(fb => fb.branchId === activeBranch.id).length === 0 ? (
+                            {feedbackSyncError && (
+                                <p role="alert" className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+                                    {feedbackSyncError}
+                                </p>
+                            )}
+                            {isFeedbackLoading ? (
+                                <p role="status" className="py-10 text-center text-sm text-gray-500">Memuat ulasan tersimpan dari Firebase...</p>
+                            ) : feedbacks.filter(fb => fb.branchId === activeBranch.id).length === 0 ? (
                                 <div className="text-center py-16 bg-gray-50 dark:bg-slate-900/30 rounded-2xl border border-dashed border-gray-200 dark:border-slate-700">
                                     <Inbox className="w-12 h-12 mx-auto text-gray-300 dark:text-gray-600 mb-3" />
                                     <p className="text-gray-500 text-sm">Belum ada masukan internal untuk cabang ini.</p>
@@ -944,10 +1149,18 @@ export default function App() {
                         <div className="bg-orange-50 dark:bg-orange-900/20 text-orange-800 dark:text-orange-300 p-4 rounded-xl mb-4 text-xs sm:text-sm border border-orange-200 dark:border-orange-900/50">
                             PIN ini digunakan untuk mengakses semua pengaturan aplikasi ini.
                         </div>
+                        {isConfigLoading && <p className="mb-4 text-sm text-gray-500 dark:text-gray-400" role="status">Memuat PIN tersimpan...</p>}
+                        {!isFirebaseReady && <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300" role="alert">Firebase belum dikonfigurasi. PIN tidak dapat disimpan lintas sesi.</p>}
+                        {configLoadError && <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-300" role="alert">{configLoadError}</p>}
                         <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">PIN Superadmin Baru</label>
-                            <input type="text" value={appConfig.adminPin} onChange={(e) => setAppConfig({...appConfig, adminPin: e.target.value})} className="w-full px-4 py-2.5 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm font-mono tracking-widest"/>
+                            <label htmlFor="admin-pin-draft" className="block text-sm font-medium mb-1 opacity-80">PIN Superadmin Baru</label>
+                            <input id="admin-pin-draft" type="password" inputMode="numeric" autoComplete="new-password" maxLength={8} aria-describedby="admin-pin-help" value={adminPinDraft} onChange={(e) => { setAdminPinDraft(e.target.value.replace(/\D/g, '').slice(0, 8)); setPinSaveStatus('idle'); setPinSaveMessage(''); }} className="w-full px-4 py-2.5 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm font-mono tracking-widest"/>
+                            <p id="admin-pin-help" className="mt-1 text-xs text-gray-500 dark:text-gray-400">Gunakan 4 sampai 8 digit angka.</p>
                         </div>
+                        <button type="button" onClick={handleSaveAdminPin} disabled={isConfigLoading || pinSaveStatus === 'saving' || !isFirebaseReady || Boolean(configLoadError) || adminPinDraft === appConfig.adminPin} className="mt-4 inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">
+                            {pinSaveStatus === 'saving' ? 'Menyimpan...' : 'Simpan PIN'}
+                        </button>
+                        {pinSaveMessage && <p className={`mt-3 text-sm ${pinSaveStatus === 'error' ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`} role={pinSaveStatus === 'error' ? 'alert' : 'status'}>{pinSaveMessage}</p>}
                     </div>
                 )}
             </div>
@@ -1086,14 +1299,19 @@ export default function App() {
                     
                     <textarea 
                         value={feedbackText}
-                        onChange={(e) => setFeedbackText(e.target.value)}
+                        onChange={(e) => { setFeedbackText(e.target.value); setFeedbackSubmitError(''); }}
                         rows={4} 
                         className="w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-slate-600 focus:border-indigo-500 dark:focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-20 transition-all resize-none text-xs sm:text-sm text-gray-700 dark:text-slate-200 mb-4 bg-gray-50 dark:bg-slate-900/50" 
                         placeholder={appConfig.pageSettings.negativePlaceholder}
                     />
+                    {feedbackSubmitError && (
+                        <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-left text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+                            {feedbackSubmitError}
+                        </p>
+                    )}
                     
-                    <button type="button" onClick={submitFeedback} className="w-full bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 dark:hover:bg-slate-600 text-white font-semibold py-3 px-6 rounded-xl shadow-md transition-all text-sm sm:text-base">
-                        {appConfig.pageSettings.negativeButtonText}
+                    <button type="button" onClick={submitFeedback} disabled={isSubmittingFeedback} className="w-full bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 dark:hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-60 text-white font-semibold py-3 px-6 rounded-xl shadow-md transition-all text-sm sm:text-base">
+                        {isSubmittingFeedback ? 'Mengirim...' : appConfig.pageSettings.negativeButtonText}
                     </button>
                     <button type="button" onClick={resetClientView} className="text-xs sm:text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 mt-4 transition-colors">
                         Batal

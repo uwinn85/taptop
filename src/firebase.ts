@@ -149,42 +149,54 @@ export async function ensureDefaultData(): Promise<void> {
   }
 }
 
-export function subscribeAppConfig(callback: (config: AppConfig | null) => void) {
+export function subscribeAppConfig(
+  callback: (config: AppConfig | null) => void,
+  onError?: (error: Error) => void,
+) {
   if (!isFirebaseReady) {
     callback(defaultConfig);
     return () => {};
   }
 
-  return onSnapshot(appConfigRef, (snapshot) => {
-    callback(snapshot.exists() ? (snapshot.data() as AppConfig) : defaultConfig);
-  });
+  return onSnapshot(
+    appConfigRef,
+    (snapshot) => {
+      callback(snapshot.exists() ? (snapshot.data() as AppConfig) : null);
+    },
+    onError,
+  );
 }
 
-export function subscribeFeedbacks(callback: (items: Feedback[]) => void) {
+export function subscribeFeedbacks(
+  callback: (items: Feedback[]) => void,
+  onError?: (error: Error) => void,
+) {
   if (!isFirebaseReady) {
     callback(defaultFeedbacks);
     return () => {};
   }
 
   const q = query(feedbackCollectionRef, orderBy('date', 'desc'));
-  return onSnapshot(q, (snapshot) => {
-    const items = snapshot.docs.map((doc) => ({
-      ...(doc.data() as Feedback),
-      id: doc.id,
-    }));
-    callback(items);
-  });
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items = snapshot.docs.map((doc) => ({
+        ...(doc.data() as Feedback),
+        id: doc.id,
+      }));
+      callback(items);
+    },
+    onError,
+  );
 }
 
 export async function saveAppConfig(config: AppConfig): Promise<void> {
-  if (!isFirebaseReady) return;
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
   await setDoc(appConfigRef, config);
 }
 
 export async function saveFeedback(feedback: Omit<Feedback, 'id'>): Promise<string> {
-  if (!isFirebaseReady) {
-    return `fb-${Date.now()}`;
-  }
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
 
   const docRef = doc(feedbackCollectionRef);
   await setDoc(docRef, {
@@ -197,11 +209,11 @@ export async function saveFeedback(feedback: Omit<Feedback, 'id'>): Promise<stri
 }
 
 export async function updateFeedback(id: string, updates: Partial<Feedback>): Promise<void> {
-  if (!isFirebaseReady) return;
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
   await updateDoc(doc(db, 'feedbacks', id), updates);
 }
 
 export async function deleteFeedbackById(id: string): Promise<void> {
-  if (!isFirebaseReady) return;
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
   await deleteDoc(doc(db, 'feedbacks', id));
 }
