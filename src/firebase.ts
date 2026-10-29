@@ -1,4 +1,4 @@
-import { initializeApp } from 'firebase/app';
+import { getApps, initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import {
   collection,
@@ -13,6 +13,7 @@ import {
   setDoc,
   updateDoc,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 
 export type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive';
@@ -34,9 +35,18 @@ export interface Feedback {
   status: 'new' | 'resolved';
 }
 
+export interface StoreReview {
+  id: string;
+  branchId: string;
+  rating: number;
+  message: string;
+  date: string;
+}
+
 export interface Branch {
   id: string;
   name: string;
+  activationCode: string;
   publicAppUrl: string;
   reviewUrl: string;
   qrColor: string;
@@ -81,15 +91,28 @@ export const isFirebaseReady = Boolean(
     import.meta.env.VITE_FIREBASE_APP_ID
 );
 
-const app = initializeApp(firebaseConfig);
+const app = getApps().find((candidate) => candidate.name === '[DEFAULT]') ?? initializeApp(firebaseConfig);
+const activationApp = getApps().find((candidate) => candidate.name === 'store-activation') ?? initializeApp(firebaseConfig, 'store-activation');
+const storeApp = getApps().find((candidate) => candidate.name === 'store-access') ?? initializeApp(firebaseConfig, 'store-access');
+
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const activationAuth = getAuth(activationApp);
+export const activationDb = getFirestore(activationApp);
+export const storeAuth = getAuth(storeApp);
+export const storeDb = getFirestore(storeApp);
+
+export function storeAuthEmailForCode(activationCode: string) {
+  const safeCode = activationCode.replace(/[^a-z0-9]/gi, '').toLowerCase();
+  return `store.${safeCode}@stores.taptop.app`;
+}
 
 export const defaultConfig: AppConfig = {
   branches: [
     {
       id: 'UTAMA1',
       name: 'Cabang Utama (Pusat)',
+      activationCode: '',
       publicAppUrl: 'https://toko-anda.com/feedback?branch=UTAMA1',
       reviewUrl: 'https://g.page/r/example/review',
       qrColor: '#4F46E5',
@@ -100,6 +123,7 @@ export const defaultConfig: AppConfig = {
     {
       id: 'CABANG2',
       name: 'Cabang Baru (Belum Aktif)',
+      activationCode: '',
       publicAppUrl: 'https://toko-anda.com/feedback?branch=CABANG2',
       reviewUrl: '',
       qrColor: '#4F46E5',
@@ -139,6 +163,7 @@ const normalizeAppConfig = (value: unknown): AppConfig => {
     return {
       id: typeof branch.id === 'string' ? branch.id : fallback.id,
       name: typeof branch.name === 'string' ? branch.name : fallback.name,
+      activationCode: typeof branch.activationCode === 'string' ? branch.activationCode : '',
       publicAppUrl: typeof branch.publicAppUrl === 'string' ? branch.publicAppUrl : fallback.publicAppUrl,
       reviewUrl: typeof branch.reviewUrl === 'string' ? branch.reviewUrl : '',
       qrColor: typeof branch.qrColor === 'string' ? branch.qrColor : fallback.qrColor,
@@ -256,16 +281,31 @@ export async function saveAppConfig(config: AppConfig): Promise<void> {
   await setDoc(appConfigRef, normalizeAppConfig(config));
 }
 
-export async function saveFeedback(feedback: Omit<Feedback, 'id'>): Promise<string> {
+export async function setStoreAccessActive(branchId: string, active: boolean): Promise<void> {
+  if (!isFirebaseReady || !auth.currentUser) throw new Error('Admin authentication is required.');
+  await setDoc(doc(db, 'storeAccess', branchId), { active, updatedAt: serverTimestamp() }, { merge: true });
+}
+
+export async function saveFeedback(feedback: Omit<Feedback, 'id'>, mirrorForStore = false): Promise<string> {
   if (!isFirebaseReady) throw new Error('Firebase is not configured.');
 
   const docRef = doc(feedbackCollectionRef);
-  await setDoc(docRef, {
-    ...feedback,
-    date: feedback.date || new Date().toISOString(),
-    createdAt: serverTimestamp(),
-  });
+  const date = feedback.date || new Date().toISOString();
+  const createdAt = serverTimestamp();
+  const batch = writeBatch(db);
+  batch.set(docRef, { ...feedback, date, createdAt });
 
+  if (mirrorForStore) {
+    batch.set(doc(db, 'storeAccess', feedback.branchId, 'reviews', docRef.id), {
+      branchId: feedback.branchId,
+      rating: feedback.rating,
+      message: feedback.message,
+      date,
+      createdAt,
+    });
+  }
+
+  await batch.commit();
   return docRef.id;
 }
 
