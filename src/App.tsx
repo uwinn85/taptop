@@ -1,16 +1,38 @@
-import React, { useState, useEffect } from 'react';
-import { 
-    Star, Store, ShieldCheck, Moon, Sun, 
-    Settings, MapPin, Inbox, Type, KeyRound, 
-    LogOut, Trash2, Copy, ExternalLink, 
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+    onAuthStateChanged,
+    sendPasswordResetEmail,
+    signInWithEmailAndPassword,
+    signOut,
+    type User,
+} from 'firebase/auth';
+import {
+    Star, Store, ShieldCheck, Moon, Sun,
+    Settings, MapPin, Inbox, Type, KeyRound,
+    LogOut, Trash2, Copy, ExternalLink,
     MessageSquare, Check, AlertTriangle, PhoneCall, Link as LinkIcon, QrCode, X, Eye, Plus
 } from 'lucide-react';
+import {
+    auth,
+    defaultConfig,
+    isFirebaseReady,
+    migrateLegacyAppConfig,
+    saveAppConfig,
+    saveFeedback,
+    subscribeAdminProfile,
+    subscribeAppConfig,
+    subscribeFeedbacks,
+    updateFeedback,
+    deleteFeedbackById,
+    type AdminProfile,
+    type AppConfig,
+    type UserRole,
+} from './firebase';
 
 // --- TIPE DATA ---
 type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive';
 type AppMode = 'client' | 'admin_login' | 'admin_dashboard';
 type AdminTab = 'qr' | 'page' | 'security' | 'feedback';
-type UserRole = 'superadmin' | 'branch_admin';
 
 interface Feedback {
     id: string;
@@ -28,7 +50,6 @@ interface Branch {
     reviewUrl: string;
     qrColor: string;
     qrBgColor: string;
-    pin: string;
     isActive: boolean;
     adminWhatsapp: string;
 }
@@ -48,6 +69,33 @@ interface PageSettings {
     thanksButtonText: string;
 }
 
+const serializeAppConfig = (config: AppConfig): string => {
+    const normalize = (value: unknown): unknown => {
+        if (Array.isArray(value)) return value.map(normalize);
+        if (value !== null && typeof value === 'object') {
+            return Object.fromEntries(
+                Object.entries(value)
+                    .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+                    .map(([key, nestedValue]) => [key, normalize(nestedValue)])
+            );
+        }
+        return value;
+    };
+
+    return JSON.stringify(normalize(config)) ?? '';
+};
+
+const getLoginErrorMessage = (error: unknown): string => {
+    const code = (error as { code?: string } | null)?.code;
+    if (['auth/invalid-credential', 'auth/wrong-password', 'auth/user-not-found', 'auth/invalid-email'].includes(code ?? '')) {
+        return 'Email atau kata sandi salah.';
+    }
+    if (code === 'auth/too-many-requests') return 'Terlalu banyak percobaan. Coba lagi nanti.';
+    if (code === 'auth/network-request-failed') return 'Koneksi gagal. Periksa internet lalu coba lagi.';
+    if (code === 'auth/operation-not-allowed') return 'Aktifkan metode Email/Sandi di Firebase Authentication.';
+    return 'Tidak dapat masuk. Periksa konfigurasi Firebase dan coba lagi.';
+};
+
 export default function App() {
     // --- STATE THEME ---
     const [isDarkMode, setIsDarkMode] = useState(false);
@@ -60,54 +108,225 @@ export default function App() {
 
     // --- STATE APLIKASI (MODE & ROLE) ---
     const [appMode, setAppMode] = useState<AppMode>('client');
-    const [adminPinInput, setAdminPinInput] = useState('');
     const [adminTab, setAdminTab] = useState<AdminTab>('qr');
     const [userRole, setUserRole] = useState<UserRole | null>(null);
+    const [authUser, setAuthUser] = useState<User | null>(null);
+    const [adminProfile, setAdminProfile] = useState<AdminProfile | null>(null);
+    const [isAuthLoading, setIsAuthLoading] = useState(isFirebaseReady);
+    const [isAuthenticating, setIsAuthenticating] = useState(false);
+    const [loginEmail, setLoginEmail] = useState('');
+    const [loginPassword, setLoginPassword] = useState('');
+    const [loginError, setLoginError] = useState('');
+    const [passwordResetStatus, setPasswordResetStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+    const [passwordResetMessage, setPasswordResetMessage] = useState('');
+    const adminProfileUnsubscribeRef = useRef<(() => void) | null>(null);
+    const adminMigrationUidRef = useRef<string | null>(null);
+    const adminMigrationStatusRef = useRef<'idle' | 'pending' | 'ready'>('idle');
 
     // --- STATE KONFIGURASI ADMIN ---
-    const [appConfig, setAppConfig] = useState({
-        adminPin: '1234',
-        branches: [
-            {
-                id: 'UTAMA1',
-                name: 'Cabang Utama (Pusat)',
-                publicAppUrl: "https://toko-anda.com/feedback?branch=UTAMA1",
-                reviewUrl: "https://g.page/r/example/review",
-                qrColor: "#4F46E5",
-                qrBgColor: "#FFFFFF",
-                pin: '1111',
-                isActive: true,
-                adminWhatsapp: "6281234567890"
+    const [appConfig, setAppConfig] = useState<AppConfig>(defaultConfig);
+    const [isConfigLoading, setIsConfigLoading] = useState(isFirebaseReady);
+    const [hasLoadedConfig, setHasLoadedConfig] = useState(false);
+    const [isAdminConfigReady, setIsAdminConfigReady] = useState(false);
+    const [configLoadError, setConfigLoadError] = useState('');
+    const [configSaveStatus, setConfigSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+    const [configSyncError, setConfigSyncError] = useState('');
+    const lastPersistedConfigRef = useRef<string | null>(null);
+    const queuedConfigJsonRef = useRef<string | null>(null);
+    const configWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const pendingConfigWritesRef = useRef(0);
+
+    const persistAppConfig = useCallback((config: AppConfig): Promise<void> => {
+        if (!isFirebaseReady || userRole !== 'superadmin' || !isAdminConfigReady) {
+            return Promise.reject(new Error('Akses superadmin diperlukan untuk menyimpan pengaturan.'));
+        }
+
+        const serializedConfig = serializeAppConfig(config);
+        if (serializedConfig === queuedConfigJsonRef.current) return Promise.resolve();
+
+        queuedConfigJsonRef.current = serializedConfig;
+        pendingConfigWritesRef.current += 1;
+        setConfigSaveStatus('saving');
+        setConfigSyncError('');
+
+        const pendingWrite = configWriteQueueRef.current
+            .catch(() => undefined)
+            .then(async () => {
+                if (serializedConfig === lastPersistedConfigRef.current) return;
+                await saveAppConfig(config);
+                lastPersistedConfigRef.current = serializedConfig;
+            })
+            .then(
+                () => {
+                    pendingConfigWritesRef.current -= 1;
+                    if (pendingConfigWritesRef.current === 0) setConfigSaveStatus('saved');
+                },
+                (error: unknown) => {
+                    pendingConfigWritesRef.current -= 1;
+                    if (queuedConfigJsonRef.current === serializedConfig) {
+                        queuedConfigJsonRef.current = lastPersistedConfigRef.current;
+                    }
+                    if (pendingConfigWritesRef.current === 0) {
+                        setConfigSaveStatus('error');
+                        setConfigSyncError('Pengaturan gagal disimpan ke Firebase.');
+                    }
+                    throw error;
+                }
+            );
+
+        configWriteQueueRef.current = pendingWrite.then(() => undefined, () => undefined);
+        return pendingWrite;
+    }, [userRole, isAdminConfigReady]);
+
+    useEffect(() => {
+        if (!isFirebaseReady) return;
+        setIsConfigLoading(true);
+        return subscribeAppConfig(
+            (config) => {
+                const nextConfig = config ?? defaultConfig;
+                const serializedConfig = config ? serializeAppConfig(config) : null;
+                if (pendingConfigWritesRef.current === 0) {
+                    lastPersistedConfigRef.current = serializedConfig;
+                    queuedConfigJsonRef.current = serializedConfig;
+                    setAppConfig(nextConfig);
+                    setConfigSaveStatus(config ? 'saved' : 'idle');
+                } else if (serializedConfig !== null && serializedConfig === queuedConfigJsonRef.current) {
+                    lastPersistedConfigRef.current = serializedConfig;
+                    setAppConfig(nextConfig);
+                }
+                setHasLoadedConfig(true);
+                setIsConfigLoading(false);
+                setConfigLoadError('');
+                setConfigSyncError('');
             },
-            {
-                id: 'CABANG2',
-                name: 'Cabang Baru (Belum Aktif)',
-                publicAppUrl: "https://toko-anda.com/feedback?branch=CABANG2",
-                reviewUrl: "",
-                qrColor: "#4F46E5",
-                qrBgColor: "#FFFFFF",
-                pin: '2222',
-                isActive: false,
-                adminWhatsapp: "6281234567890"
+            () => {
+                setIsConfigLoading(false);
+                setConfigLoadError('Konfigurasi aplikasi gagal dimuat dari Firebase.');
             }
-        ] as Branch[],
-        pageSettings: {
-            title: "Halo! 👋",
-            subtitle: "Cerita luar biasa Anda adalah penyambung nyawa bisnis kami. Berikan 5 bintang terbaik anda",
-            positiveTitle: "Kami Senang Anda Puas! 🎉",
-            positiveText: "Selangkah lagi untuk Sempurnakan momen luar biasa anda hari ini, untuk menginspirasi dunia di Google",
-            positiveButtonText: "Beri Ulasan di Google",
-            negativeTitle: "Mohon Maaf Atas Ketidaknyamanan Ini",
-            negativeText: "Bantu kami menjadi lebih baik. Ceritakan apa yang kurang memuaskan dari layanan kami.",
-            negativePlaceholder: "Ketik masukan Anda di sini...",
-            negativeButtonText: "Kirim Masukan",
-            thanksTitle: "Terima Kasih!",
-            thanksText: "Masukan Anda telah kami terima dan akan langsung diteruskan ke tim manajemen kami.",
-            thanksButtonText: "Selesai"
-        } as PageSettings
-    });
+        );
+    }, []);
+
+    useEffect(() => {
+        if (!isFirebaseReady || userRole !== 'superadmin' || !isAdminConfigReady || !hasLoadedConfig || isConfigLoading || configLoadError) return;
+        const serializedConfig = serializeAppConfig(appConfig);
+        if (serializedConfig === queuedConfigJsonRef.current) {
+            if (pendingConfigWritesRef.current === 0) setConfigSaveStatus('saved');
+            return;
+        }
+
+        setConfigSaveStatus('saving');
+        const timeoutId = window.setTimeout(() => {
+            void persistAppConfig(appConfig).catch(() => undefined);
+        }, 500);
+        return () => window.clearTimeout(timeoutId);
+    }, [appConfig, userRole, isAdminConfigReady, hasLoadedConfig, isConfigLoading, configLoadError, persistAppConfig]);
 
     const [selectedBranchIndex, setSelectedBranchIndex] = useState(0);
+
+    useEffect(() => {
+        if (!isFirebaseReady) {
+            setIsAuthLoading(false);
+            return;
+        }
+
+        const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+            adminProfileUnsubscribeRef.current?.();
+            adminProfileUnsubscribeRef.current = null;
+            adminMigrationUidRef.current = null;
+            adminMigrationStatusRef.current = 'idle';
+            setAuthUser(user);
+            setAdminProfile(null);
+            setUserRole(null);
+            setIsAdminConfigReady(false);
+
+            if (!user) {
+                setIsAuthLoading(false);
+                setIsAuthenticating(false);
+                setLoginPassword('');
+                setAppMode('client');
+                setLoginError('');
+                return;
+            }
+
+            setIsAuthLoading(true);
+            adminProfileUnsubscribeRef.current = subscribeAdminProfile(
+                user.uid,
+                (profile) => {
+                    if (!profile || (profile.role === 'branch_admin' && !profile.branchId)) {
+                        setAdminProfile(null);
+                        setUserRole(null);
+                        setIsAdminConfigReady(false);
+                        setIsAuthLoading(false);
+                        setIsAuthenticating(false);
+                        setAppMode('admin_login');
+                        setLoginError('Akun ini belum memiliki profil admin yang valid di Firestore.');
+                        return;
+                    }
+
+                    setAdminProfile(profile);
+                    setUserRole(profile.role);
+                    setAdminTab(profile.role === 'superadmin' ? 'qr' : 'feedback');
+                    setLoginError('');
+
+                    if (profile.role === 'branch_admin') {
+                        setIsAdminConfigReady(false);
+                        setIsAuthLoading(true);
+                        return;
+                    }
+
+                    if (adminMigrationStatusRef.current === 'ready' && adminMigrationUidRef.current === user.uid) {
+                        setIsAdminConfigReady(true);
+                        setAppMode('admin_dashboard');
+                        setIsAuthLoading(false);
+                        setIsAuthenticating(false);
+                        return;
+                    }
+
+                    if (adminMigrationStatusRef.current === 'pending' && adminMigrationUidRef.current === user.uid) return;
+
+                    adminMigrationUidRef.current = user.uid;
+                    adminMigrationStatusRef.current = 'pending';
+                    setIsAuthLoading(true);
+                    void migrateLegacyAppConfig().then(() => {
+                        if (auth.currentUser?.uid !== user.uid) return;
+                        adminMigrationStatusRef.current = 'ready';
+                        setIsAdminConfigReady(true);
+                        setAppMode('admin_dashboard');
+                        setIsAuthLoading(false);
+                        setIsAuthenticating(false);
+                    }).catch(() => {
+                        adminMigrationUidRef.current = null;
+                        adminMigrationStatusRef.current = 'idle';
+                        setIsAdminConfigReady(false);
+                        setIsAuthLoading(false);
+                        setIsAuthenticating(false);
+                        setAppMode('admin_login');
+                        setLoginError('Konfigurasi Firebase gagal disiapkan. Periksa Firestore Rules, lalu keluar dan masuk kembali.');
+                    });
+                },
+                () => {
+                    setAdminProfile(null);
+                    setUserRole(null);
+                    setIsAdminConfigReady(false);
+                    setIsAuthLoading(false);
+                    setIsAuthenticating(false);
+                    setAppMode('admin_login');
+                    setLoginError('Tidak dapat membaca profil admin dari Firestore.');
+                }
+            );
+        }, (error) => {
+            setIsAuthLoading(false);
+            setIsAuthenticating(false);
+            setLoginError(getLoginErrorMessage(error));
+        });
+
+        return () => {
+            unsubscribeAuth();
+            adminProfileUnsubscribeRef.current?.();
+            adminProfileUnsubscribeRef.current = null;
+        };
+    }, []);
+
     const [showQrModal, setShowQrModal] = useState(false);
     
     // Modal state untuk bulk add branches
@@ -131,16 +350,39 @@ export default function App() {
     const activeBranch = appConfig.branches[selectedBranchIndex] || appConfig.branches[0];
     const clientBranch = appConfig.branches.find(b => b.id === currentClientBranchId) || appConfig.branches[0];
 
+    useEffect(() => {
+        if (adminProfile?.role !== 'branch_admin' || !authUser) return;
+        if (!hasLoadedConfig) {
+            if (configLoadError) {
+                setIsAuthLoading(false);
+                setAppMode('admin_login');
+                setLoginError(configLoadError);
+            }
+            return;
+        }
+
+        const branchIndex = appConfig.branches.findIndex((branch) => branch.id === adminProfile.branchId);
+        if (branchIndex === -1) {
+            setIsAuthLoading(false);
+            setAppMode('admin_login');
+            setLoginError('Profil admin tidak terhubung ke cabang yang tersedia.');
+            setUserRole(null);
+            return;
+        }
+
+        setSelectedBranchIndex(branchIndex);
+        setAppMode('admin_dashboard');
+        setIsAuthLoading(false);
+        setIsAuthenticating(false);
+        setLoginError('');
+    }, [adminProfile, authUser, hasLoadedConfig, configLoadError, appConfig.branches]);
+
     // --- STATE CLIENT (PENGUNJUNG) ---
     const [view, setView] = useState<ViewState>('rating');
     const [hoveredRating, setHoveredRating] = useState(0);
     const [selectedRating, setSelectedRating] = useState(0);
     const [feedbackText, setFeedbackText] = useState('');
     
-    // Modal state untuk aktivasi kartu di sisi client
-    const [showActivationModal, setShowActivationModal] = useState(false);
-    const [activationPin, setActivationPin] = useState('');
-
     // Cek status keaktifan saat client load
     useEffect(() => {
         if (!clientBranch || !clientBranch.isActive) {
@@ -150,25 +392,38 @@ export default function App() {
         }
     }, [currentClientBranchId, clientBranch]);
     
-    // --- STATE DUMMY DATA FEEDBACK ---
-    const [feedbacks, setFeedbacks] = useState<Feedback[]>([
-        {
-            id: 'fb-1',
-            branchId: 'UTAMA1',
-            rating: 5,
-            message: 'Pelayanan sangat ramah dan tempatnya bersih sekali!',
-            date: new Date(Date.now() - 86400000).toISOString(),
-            status: 'resolved'
-        },
-        {
-            id: 'fb-2',
-            branchId: 'UTAMA1',
-            rating: 2,
-            message: 'Parkiran terlalu sempit dan antrian cukup lama.',
-            date: new Date().toISOString(),
-            status: 'new'
+    // --- DATA ULASAN REAL-TIME ---
+    const [feedbacks, setFeedbacks] = useState<Feedback[]>([]);
+    const [isFeedbackLoading, setIsFeedbackLoading] = useState(false);
+    const [feedbackSyncError, setFeedbackSyncError] = useState('');
+    const [feedbackSubmitError, setFeedbackSubmitError] = useState('');
+    const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
+
+    useEffect(() => {
+        if (!isFirebaseReady || !adminProfile) {
+            setFeedbacks([]);
+            setSelectedFeedbackModal(null);
+            setIsFeedbackLoading(false);
+            setFeedbackSyncError('');
+            return;
         }
-    ]);
+
+        setIsFeedbackLoading(true);
+        const branchId = adminProfile.role === 'branch_admin' ? adminProfile.branchId : undefined;
+        return subscribeFeedbacks(
+            (items) => {
+                setFeedbacks(items);
+                setSelectedFeedbackModal((current) => current ? items.find((item) => item.id === current.id) ?? null : null);
+                setIsFeedbackLoading(false);
+                setFeedbackSyncError('');
+            },
+            branchId,
+            () => {
+                setIsFeedbackLoading(false);
+                setFeedbackSyncError('Data ulasan gagal dimuat dari Firebase.');
+            }
+        );
+    }, [adminProfile]);
 
     const ratingDescriptions = [
         "",
@@ -189,20 +444,36 @@ export default function App() {
         }
     };
 
-    const submitFeedback = () => {
-        if (!feedbackText.trim()) return;
-        
-        const newFeedback: Feedback = {
-            id: `fb-${Date.now()}`,
+    const submitFeedback = async () => {
+        const message = feedbackText.trim();
+        if (!message || isSubmittingFeedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSubmitError('Firebase belum dikonfigurasi, jadi ulasan belum dapat disimpan.');
+            return;
+        }
+
+        const feedbackData = {
             branchId: clientBranch.id,
             rating: selectedRating,
-            message: feedbackText,
+            message,
             date: new Date().toISOString(),
-            status: 'new'
+            status: 'new' as const,
         };
-        
-        setFeedbacks([newFeedback, ...feedbacks]);
-        setView('thanks');
+
+        setFeedbackSubmitError('');
+        setIsSubmittingFeedback(true);
+        try {
+            const id = await saveFeedback(feedbackData);
+            const newFeedback: Feedback = { ...feedbackData, id };
+            setFeedbacks((current) => current.some((item) => item.id === id) ? current : [newFeedback, ...current]);
+            setFeedbackText('');
+            setView('thanks');
+        } catch {
+            setFeedbackSubmitError('Ulasan gagal dikirim ke Firebase. Periksa koneksi dan coba lagi.');
+            setFeedbackSyncError('Ulasan gagal disimpan ke Firebase.');
+        } finally {
+            setIsSubmittingFeedback(false);
+        }
     };
 
     const resetClientView = () => {
@@ -213,6 +484,7 @@ export default function App() {
         }
         setSelectedRating(0);
         setHoveredRating(0);
+        setFeedbackSubmitError('');
     };
 
     const goToGoogleReview = () => {
@@ -252,43 +524,27 @@ export default function App() {
         }
     };
 
-    const handleClientActivation = (e: React.FormEvent) => {
-        e.preventDefault();
-        if (activationPin === appConfig.adminPin || activationPin === clientBranch.pin) {
-            const updatedBranches = appConfig.branches.map(b => {
-                if (b.id === clientBranch.id) {
-                    return { ...b, isActive: true };
-                }
-                return b;
-            });
-            setAppConfig({ ...appConfig, branches: updatedBranches });
-            setShowActivationModal(false);
-            setActivationPin('');
-            setView('rating');
-        } else {
-            alert('PIN Aktivasi Salah!');
-        }
-    };
-
     // --- LOGIC ADMIN ---
-    const handleLogin = (e: React.FormEvent) => {
+    const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (adminPinInput === appConfig.adminPin) { 
-            setUserRole('superadmin');
-            setAppMode('admin_dashboard');
-            setAdminTab('qr');
-            setAdminPinInput('');
-        } else {
-            const branchMatchIndex = appConfig.branches.findIndex(b => b.pin === adminPinInput && b.pin !== '');
-            if (branchMatchIndex !== -1) {
-                setUserRole('branch_admin');
-                setSelectedBranchIndex(branchMatchIndex);
-                setAppMode('admin_dashboard');
-                setAdminTab('feedback'); 
-                setAdminPinInput('');
-            } else {
-                alert('PIN Salah! Gunakan 1234 untuk Superadmin, atau PIN Toko yang terdaftar.');
-            }
+        const email = loginEmail.trim().toLowerCase();
+        if (!isFirebaseReady) {
+            setLoginError('Firebase belum dikonfigurasi. Admin tidak dapat masuk.');
+            return;
+        }
+        if (!email || !loginPassword) {
+            setLoginError('Masukkan email dan kata sandi.');
+            return;
+        }
+
+        setIsAuthenticating(true);
+        setLoginError('');
+        try {
+            await signInWithEmailAndPassword(auth, email, loginPassword);
+            setLoginPassword('');
+        } catch (error) {
+            setIsAuthenticating(false);
+            setLoginError(getLoginErrorMessage(error));
         }
     };
 
@@ -305,7 +561,6 @@ export default function App() {
             reviewUrl: "",
             qrColor: "#4F46E5",
             qrBgColor: "#FFFFFF",
-            pin: Math.floor(1000 + Math.random() * 9000).toString(),
             isActive: false,
             adminWhatsapp: "6281234567890"
         };
@@ -344,7 +599,6 @@ export default function App() {
                 reviewUrl: "",
                 qrColor: "#4F46E5",
                 qrBgColor: "#FFFFFF",
-                pin: Math.floor(1000 + Math.random() * 9000).toString(),
                 isActive: false,
                 adminWhatsapp: "6281234567890"
             };
@@ -389,17 +643,76 @@ export default function App() {
         });
     };
 
-    const toggleFeedbackStatus = (id: string) => {
-        setFeedbacks(feedbacks.map(fb => fb.id === id ? { ...fb, status: fb.status === 'new' ? 'resolved' : 'new' } : fb));
-        if (selectedFeedbackModal && selectedFeedbackModal.id === id) {
-            setSelectedFeedbackModal(prev => prev ? { ...prev, status: prev.status === 'new' ? 'resolved' : 'new' } : null);
+    const handlePasswordReset = async (emailAddress = authUser?.email ?? '') => {
+        const email = emailAddress.trim().toLowerCase();
+        if (!email) {
+            setPasswordResetStatus('error');
+            setPasswordResetMessage('Masukkan email untuk menerima tautan reset kata sandi.');
+            return;
+        }
+        if (!isFirebaseReady) {
+            setPasswordResetStatus('error');
+            setPasswordResetMessage('Firebase belum dikonfigurasi.');
+            return;
+        }
+
+        setPasswordResetStatus('sending');
+        setPasswordResetMessage('');
+        try {
+            await sendPasswordResetEmail(auth, email);
+            setPasswordResetStatus('sent');
+            setPasswordResetMessage('Jika email terdaftar, tautan reset kata sandi akan dikirim.');
+        } catch {
+            setPasswordResetStatus('error');
+            setPasswordResetMessage('Email reset gagal dikirim. Periksa konfigurasi Firebase Auth.');
         }
     };
 
-    const deleteFeedback = (id: string) => {
-        setFeedbacks(feedbacks.filter(fb => fb.id !== id));
-        if (selectedFeedbackModal && selectedFeedbackModal.id === id) {
-            setSelectedFeedbackModal(null);
+    const toggleFeedbackStatus = async (id: string) => {
+        const feedback = feedbacks.find((item) => item.id === id);
+        if (!feedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSyncError('Firebase belum dikonfigurasi. Status ulasan tidak dapat disimpan.');
+            return;
+        }
+
+        const nextStatus = feedback.status === 'new' ? 'resolved' : 'new';
+        setFeedbacks((current) => current.map((item) => item.id === id ? { ...item, status: nextStatus } : item));
+        setSelectedFeedbackModal((current) => current?.id === id ? { ...current, status: nextStatus } : current);
+
+        try {
+            await updateFeedback(id, { status: nextStatus });
+            setFeedbackSyncError('');
+        } catch {
+            setFeedbacks((current) => current.map((item) => item.id === id ? { ...item, status: feedback.status } : item));
+            setSelectedFeedbackModal((current) => current?.id === id ? { ...current, status: feedback.status } : current);
+            setFeedbackSyncError('Status ulasan gagal disimpan ke Firebase.');
+        }
+    };
+
+    const deleteFeedback = async (id: string) => {
+        const feedbackIndex = feedbacks.findIndex((item) => item.id === id);
+        const feedback = feedbacks[feedbackIndex];
+        if (!feedback) return;
+        if (!isFirebaseReady) {
+            setFeedbackSyncError('Firebase belum dikonfigurasi. Ulasan tidak dapat dihapus.');
+            return;
+        }
+
+        setFeedbacks((current) => current.filter((item) => item.id !== id));
+        setSelectedFeedbackModal((current) => current?.id === id ? null : current);
+
+        try {
+            await deleteFeedbackById(id);
+            setFeedbackSyncError('');
+        } catch {
+            setFeedbacks((current) => {
+                if (current.some((item) => item.id === id)) return current;
+                const restored = [...current];
+                restored.splice(Math.min(feedbackIndex, restored.length), 0, feedback);
+                return restored;
+            });
+            setFeedbackSyncError('Ulasan gagal dihapus dari Firebase.');
         }
     };
 
@@ -410,20 +723,49 @@ export default function App() {
                 <ShieldCheck className="w-8 h-8 text-indigo-600 dark:text-indigo-400" />
             </div>
             <h2 className="text-xl sm:text-2xl font-bold mb-2">Akses Sistem</h2>
-            <p className="text-gray-500 dark:text-gray-400 text-xs sm:text-sm mb-6">Masukkan PIN Admin atau PIN Cabang</p>
-            <form onSubmit={handleLogin} className="space-y-4">
-                <input 
-                    type="password" 
-                    value={adminPinInput}
-                    onChange={(e) => setAdminPinInput(e.target.value)}
-                    placeholder="Masukkan PIN..."
-                    className="w-full text-center tracking-widest text-base sm:text-lg px-4 py-3 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500"
-                    autoFocus
-                />
-                <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-xl transition-all text-sm sm:text-base">
-                    Masuk
+            <p className="text-gray-500 dark:text-gray-400 text-xs sm:text-sm mb-2">Masuk dengan akun administrator Firebase.</p>
+            <p className="mb-6 text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">Akun admin dibuat di Firebase Authentication dan aksesnya diberikan melalui dokumen adminUsers di Firestore.</p>
+            <form onSubmit={handleLogin} className="space-y-4" aria-busy={isAuthenticating || isAuthLoading}>
+                <div className="text-left">
+                    <label htmlFor="admin-email" className="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">Email</label>
+                    <input
+                        id="admin-email"
+                        type="email"
+                        autoComplete="username"
+                        value={loginEmail}
+                        onChange={(event) => { setLoginEmail(event.target.value); setLoginError(''); setPasswordResetStatus('idle'); setPasswordResetMessage(''); }}
+                        placeholder="admin@domain.com"
+                        className="w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm"
+                        required
+                    />
+                </div>
+                <div className="text-left">
+                    <label htmlFor="admin-password" className="mb-1 block text-xs font-medium text-gray-600 dark:text-gray-300">Kata sandi</label>
+                    <input
+                        id="admin-password"
+                        type="password"
+                        autoComplete="current-password"
+                        value={loginPassword}
+                        onChange={(event) => { setLoginPassword(event.target.value); setLoginError(''); }}
+                        placeholder="Masukkan kata sandi"
+                        className="w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm"
+                        required
+                    />
+                </div>
+                {loginError && <p role="alert" className="text-left text-xs text-red-600 dark:text-red-400">{loginError}</p>}
+                <button type="submit" disabled={isAuthenticating || isAuthLoading} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-xl transition-all text-sm sm:text-base disabled:cursor-not-allowed disabled:opacity-60">
+                    {isAuthenticating || isAuthLoading ? 'Memverifikasi...' : 'Masuk'}
                 </button>
+                <button type="button" onClick={() => { void handlePasswordReset(loginEmail); }} disabled={passwordResetStatus === 'sending'} className="w-full py-1 text-xs font-medium text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 dark:hover:text-indigo-300 disabled:opacity-50">
+                    {passwordResetStatus === 'sending' ? 'Mengirim tautan...' : 'Lupa kata sandi?'}
+                </button>
+                {passwordResetMessage && <p role={passwordResetStatus === 'error' ? 'alert' : 'status'} className={`text-left text-xs ${passwordResetStatus === 'error' ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`}>{passwordResetMessage}</p>}
             </form>
+            {authUser && (
+                <button type="button" onClick={() => { void signOut(auth).catch(() => setLoginError('Gagal keluar dari Firebase Auth.')); }} className="mt-3 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">
+                    Keluar dari akun ini
+                </button>
+            )}
             <button onClick={() => setAppMode('client')} className="mt-4 text-xs sm:text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">
                 Batal
             </button>
@@ -444,6 +786,35 @@ export default function App() {
                             {userRole === 'superadmin' ? 'Admin Dashboard Utama' : `Panel Toko: ${activeBranch.name}`}
                         </h2>
                         <p className="text-xs text-gray-500 dark:text-gray-400">Kelola operasional dan ulasan pelanggan secara terpusat</p>
+                        <p
+                            role="status"
+                            aria-live="polite"
+                            className={`mt-1 text-xs ${!isFirebaseReady || configLoadError || configSyncError || feedbackSyncError ? 'text-amber-600 dark:text-amber-400' : configSaveStatus === 'saving' || isConfigLoading || isFeedbackLoading ? 'text-indigo-600 dark:text-indigo-400' : 'text-emerald-600 dark:text-emerald-400'}`}
+                        >
+                            {!isFirebaseReady
+                                ? 'Firebase belum dikonfigurasi — data dan pengaturan tidak tersinkron.'
+                                : configLoadError || configSyncError || feedbackSyncError
+                                    ? 'Sinkronisasi Firebase bermasalah.'
+                                    : isConfigLoading || isFeedbackLoading
+                                        ? 'Menghubungkan ke Firebase...'
+                                        : configSaveStatus === 'saving'
+                                            ? 'Menyinkronkan data dan pengaturan...'
+                                            : 'Data dan pengaturan tersinkron dengan Firebase.'}
+                        </p>
+                        {(configLoadError || configSyncError || feedbackSyncError) && (
+                            <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
+                                {configLoadError || configSyncError || feedbackSyncError}
+                            </p>
+                        )}
+                        {configSaveStatus === 'error' && (
+                            <button
+                                type="button"
+                                onClick={() => { void persistAppConfig(appConfig).catch(() => undefined); }}
+                                className="mt-1 text-xs font-medium text-indigo-600 underline dark:text-indigo-400"
+                            >
+                                Coba simpan pengaturan lagi
+                            </button>
+                        )}
                     </div>
                 </div>
                 <div className="flex flex-wrap gap-2 w-full md:w-auto items-center">
@@ -458,12 +829,14 @@ export default function App() {
                             <button onClick={() => setAdminTab('page')} className={`px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-medium transition-colors flex items-center gap-2 ${adminTab === 'page' ? 'bg-indigo-600 text-white shadow-md' : 'bg-white dark:bg-slate-800 hover:bg-gray-100 dark:hover:bg-slate-700 border border-gray-200 dark:border-slate-700'}`}>
                                 <Type className="w-4 h-4" /> Pengaturan Halaman
                             </button>
-                            <button onClick={() => setAdminTab('security')} className={`px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-medium transition-colors flex items-center gap-2 ${adminTab === 'security' ? 'bg-indigo-600 text-white shadow-md' : 'bg-white dark:bg-slate-800 hover:bg-gray-100 dark:hover:bg-slate-700 border border-gray-200 dark:border-slate-700'}`}>
-                                <KeyRound className="w-4 h-4" /> Keamanan
-                            </button>
                         </>
                     )}
-                    <button onClick={() => { setAppMode('client'); setUserRole(null); }} className="ml-auto flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-xl hover:bg-red-100 dark:hover:bg-red-800/40 transition-colors font-medium text-xs sm:text-sm border border-red-200 dark:border-red-900/50">
+                    {userRole && (
+                        <button onClick={() => setAdminTab('security')} className={`px-3 sm:px-4 py-2 rounded-xl text-xs sm:text-sm font-medium transition-colors flex items-center gap-2 ${adminTab === 'security' ? 'bg-indigo-600 text-white shadow-md' : 'bg-white dark:bg-slate-800 hover:bg-gray-100 dark:hover:bg-slate-700 border border-gray-200 dark:border-slate-700'}`}>
+                            <KeyRound className="w-4 h-4" /> Keamanan
+                        </button>
+                    )}
+                    <button onClick={() => { void signOut(auth).catch(() => setConfigSyncError('Gagal keluar dari akun Firebase.')); }} className="ml-auto flex items-center gap-2 px-4 py-2 bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 rounded-xl hover:bg-red-100 dark:hover:bg-red-800/40 transition-colors font-medium text-xs sm:text-sm border border-red-200 dark:border-red-900/50">
                         <LogOut className="w-4 h-4" /> Keluar
                     </button>
                 </div>
@@ -494,7 +867,6 @@ export default function App() {
                                         <th className="py-3 px-4">ID Cabang</th>
                                         <th className="py-3 px-4">Nama Toko / Cabang</th>
                                         <th className="py-3 px-4">Status</th>
-                                        <th className="py-3 px-4">PIN Toko</th>
                                         <th className="py-3 px-4">Google Review / Place ID</th>
                                         <th className="py-3 px-4 text-center">Aksi</th>
                                     </tr>
@@ -526,14 +898,6 @@ export default function App() {
                                                 >
                                                     {branch.isActive ? 'Aktif' : 'Nonaktif'}
                                                 </button>
-                                            </td>
-                                            <td className="py-3 px-4 font-mono">
-                                                <input 
-                                                    type="text" 
-                                                    value={branch.pin} 
-                                                    onChange={(e) => updateBranchAtIndex(index, 'pin', e.target.value)}
-                                                    className="w-20 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded px-2 py-1 text-center font-mono text-xs"
-                                                />
                                             </td>
                                             <td className="py-3 px-4">
                                                 <input 
@@ -738,7 +1102,14 @@ export default function App() {
                                 <MessageSquare className="w-5 h-5 text-indigo-500" /> Kotak Masuk Ulasan: {activeBranch.name}
                             </h3>
                             
-                            {feedbacks.filter(fb => fb.branchId === activeBranch.id).length === 0 ? (
+                            {feedbackSyncError && (
+                                <p role="alert" className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+                                    {feedbackSyncError}
+                                </p>
+                            )}
+                            {isFeedbackLoading ? (
+                                <p role="status" className="py-10 text-center text-sm text-gray-500">Memuat ulasan tersimpan dari Firebase...</p>
+                            ) : feedbacks.filter(fb => fb.branchId === activeBranch.id).length === 0 ? (
                                 <div className="text-center py-16 bg-gray-50 dark:bg-slate-900/30 rounded-2xl border border-dashed border-gray-200 dark:border-slate-700">
                                     <Inbox className="w-12 h-12 mx-auto text-gray-300 dark:text-gray-600 mb-3" />
                                     <p className="text-gray-500 text-sm">Belum ada masukan internal untuk cabang ini.</p>
@@ -938,16 +1309,38 @@ export default function App() {
                     </div>
                 )}
 
-                {adminTab === 'security' && userRole === 'superadmin' && (
+                    {adminTab === 'security' && userRole && adminProfile && (
                     <div className="max-w-md overflow-y-auto pr-1">
-                        <h3 className="font-semibold text-lg mb-4 flex items-center gap-2"><KeyRound className="w-5 h-5 text-indigo-500"/> Ubah PIN Superadmin</h3>
-                        <div className="bg-orange-50 dark:bg-orange-900/20 text-orange-800 dark:text-orange-300 p-4 rounded-xl mb-4 text-xs sm:text-sm border border-orange-200 dark:border-orange-900/50">
-                            PIN ini digunakan untuk mengakses semua pengaturan aplikasi ini.
+                        <h3 className="font-semibold text-lg mb-4 flex items-center gap-2"><KeyRound className="w-5 h-5 text-indigo-500"/> Keamanan Akun Firebase</h3>
+                        <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                            Akses admin menggunakan Firebase Authentication. Kata sandi tidak disimpan di Firestore.
+                        </p>
+                        <div className="rounded-xl border border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-900/50 p-4 space-y-3">
+                            <div>
+                                <span className="block text-xs text-gray-500 dark:text-gray-400">Akun</span>
+                                <span className="text-sm font-medium">{authUser?.email ?? 'Email tidak tersedia'}</span>
+                            </div>
+                            <div>
+                                <span className="block text-xs text-gray-500 dark:text-gray-400">Peran</span>
+                                <span className="text-sm font-medium">{userRole === 'superadmin' ? 'Superadmin' : `Admin cabang · ${activeBranch.name}`}</span>
+                            </div>
                         </div>
-                        <div>
-                            <label className="block text-sm font-medium mb-1 opacity-80">PIN Superadmin Baru</label>
-                            <input type="text" value={appConfig.adminPin} onChange={(e) => setAppConfig({...appConfig, adminPin: e.target.value})} className="w-full px-4 py-2.5 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm font-mono tracking-widest"/>
-                        </div>
+                        <button
+                            type="button"
+                            onClick={() => { void handlePasswordReset(); }}
+                            disabled={passwordResetStatus === 'sending' || !authUser?.email}
+                            className="mt-4 inline-flex items-center justify-center rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                            {passwordResetStatus === 'sending' ? 'Mengirim email...' : 'Kirim tautan reset kata sandi'}
+                        </button>
+                        {passwordResetMessage && (
+                            <p className={`mt-3 text-sm ${passwordResetStatus === 'error' ? 'text-red-600 dark:text-red-400' : 'text-emerald-600 dark:text-emerald-400'}`} role={passwordResetStatus === 'error' ? 'alert' : 'status'}>
+                                {passwordResetMessage}
+                            </p>
+                        )}
+                        <p className="mt-5 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                            Akun dan peran admin dikelola melalui Firebase Authentication serta dokumen adminUsers di Firestore.
+                        </p>
                     </div>
                 )}
             </div>
@@ -968,14 +1361,9 @@ export default function App() {
                     </p>
 
                     <div className="space-y-3">
-                        <button 
-                            type="button"
-                            onClick={() => setShowActivationModal(true)}
-                            className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 px-6 rounded-xl transition-all shadow-md flex items-center justify-center gap-2 text-xs sm:text-sm"
-                        >
-                            <KeyRound className="w-4 h-4" /> Aktifkan Kartu Ini
-                        </button>
-
+                        <p className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-xs leading-relaxed text-orange-800 dark:border-orange-900/50 dark:bg-orange-900/20 dark:text-orange-300">
+                            Kartu ini hanya dapat diaktifkan oleh superadmin melalui dashboard. Hubungi admin untuk meminta aktivasi.
+                        </p>
                         <a 
                             href={`https://wa.me/${clientBranch ? clientBranch.adminWhatsapp : '6281234567890'}?text=Halo%20Admin,%20saya%20ingin%20mengaktifkan%20kartu%20QR%20untuk%20toko%20ID:%20${currentClientBranchId}`}
                             target="_blank"
@@ -997,28 +1385,6 @@ export default function App() {
                         </button>
                     </div>
 
-                    {showActivationModal && (
-                        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                            <div className={`w-full max-w-sm rounded-2xl p-6 ${isDarkMode ? 'bg-slate-800 text-white' : 'bg-white text-gray-800'} shadow-2xl`}>
-                                <h3 className="font-bold text-lg mb-2">Aktivasi Kartu QR</h3>
-                                <p className="text-xs text-gray-500 mb-4">Masukkan PIN Admin atau PIN Toko untuk mengaktifkan kartu ini secara instan.</p>
-                                <form onSubmit={handleClientActivation} className="space-y-4">
-                                    <input 
-                                        type="password" 
-                                        value={activationPin}
-                                        onChange={(e) => setActivationPin(e.target.value)}
-                                        placeholder="Masukkan PIN..."
-                                        className="w-full text-center tracking-widest px-4 py-2.5 rounded-xl border border-gray-200 dark:border-slate-600 bg-gray-50 dark:bg-slate-900/50 outline-none focus:border-indigo-500 text-sm"
-                                        autoFocus
-                                    />
-                                    <div className="flex gap-2">
-                                        <button type="button" onClick={() => setShowActivationModal(false)} className="w-1/2 bg-gray-200 dark:bg-slate-700 py-2.5 rounded-xl text-sm font-medium">Batal</button>
-                                        <button type="submit" className="w-1/2 bg-indigo-600 text-white py-2.5 rounded-xl text-sm font-medium">Konfirmasi</button>
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-                    )}
                 </div>
             )}
 
@@ -1086,14 +1452,20 @@ export default function App() {
                     
                     <textarea 
                         value={feedbackText}
-                        onChange={(e) => setFeedbackText(e.target.value)}
-                        rows={4} 
+                        onChange={(e) => { setFeedbackText(e.target.value); setFeedbackSubmitError(''); }}
+                        rows={4}
+                        maxLength={4000}
                         className="w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-slate-600 focus:border-indigo-500 dark:focus:border-indigo-400 focus:ring-2 focus:ring-indigo-500 focus:ring-opacity-20 transition-all resize-none text-xs sm:text-sm text-gray-700 dark:text-slate-200 mb-4 bg-gray-50 dark:bg-slate-900/50" 
                         placeholder={appConfig.pageSettings.negativePlaceholder}
                     />
+                    {feedbackSubmitError && (
+                        <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-left text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+                            {feedbackSubmitError}
+                        </p>
+                    )}
                     
-                    <button type="button" onClick={submitFeedback} className="w-full bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 dark:hover:bg-slate-600 text-white font-semibold py-3 px-6 rounded-xl shadow-md transition-all text-sm sm:text-base">
-                        {appConfig.pageSettings.negativeButtonText}
+                    <button type="button" onClick={submitFeedback} disabled={isSubmittingFeedback} className="w-full bg-slate-900 dark:bg-slate-700 hover:bg-slate-800 dark:hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-60 text-white font-semibold py-3 px-6 rounded-xl shadow-md transition-all text-sm sm:text-base">
+                        {isSubmittingFeedback ? 'Mengirim...' : appConfig.pageSettings.negativeButtonText}
                     </button>
                     <button type="button" onClick={resetClientView} className="text-xs sm:text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 mt-4 transition-colors">
                         Batal

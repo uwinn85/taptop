@@ -1,22 +1,29 @@
 import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
   doc,
-  getDoc,
   getFirestore,
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
+  where,
 } from 'firebase/firestore';
 
 export type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive';
 export type AppMode = 'client' | 'admin_login' | 'admin_dashboard';
 export type AdminTab = 'qr' | 'page' | 'security' | 'feedback';
 export type UserRole = 'superadmin' | 'branch_admin';
+
+export interface AdminProfile {
+  role: UserRole;
+  branchId?: string;
+}
 
 export interface Feedback {
   id: string;
@@ -34,7 +41,6 @@ export interface Branch {
   reviewUrl: string;
   qrColor: string;
   qrBgColor: string;
-  pin: string;
   isActive: boolean;
   adminWhatsapp: string;
 }
@@ -55,7 +61,6 @@ export interface PageSettings {
 }
 
 export interface AppConfig {
-  adminPin: string;
   branches: Branch[];
   pageSettings: PageSettings;
 }
@@ -72,14 +77,15 @@ const firebaseConfig = {
 export const isFirebaseReady = Boolean(
   import.meta.env.VITE_FIREBASE_PROJECT_ID &&
     import.meta.env.VITE_FIREBASE_API_KEY &&
-    import.meta.env.VITE_FIREBASE_AUTH_DOMAIN
+    import.meta.env.VITE_FIREBASE_AUTH_DOMAIN &&
+    import.meta.env.VITE_FIREBASE_APP_ID
 );
 
 const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
 export const db = getFirestore(app);
 
 export const defaultConfig: AppConfig = {
-  adminPin: '1234',
   branches: [
     {
       id: 'UTAMA1',
@@ -88,7 +94,6 @@ export const defaultConfig: AppConfig = {
       reviewUrl: 'https://g.page/r/example/review',
       qrColor: '#4F46E5',
       qrBgColor: '#FFFFFF',
-      pin: '1111',
       isActive: true,
       adminWhatsapp: '6281234567890',
     },
@@ -99,7 +104,6 @@ export const defaultConfig: AppConfig = {
       reviewUrl: '',
       qrColor: '#4F46E5',
       qrBgColor: '#FFFFFF',
-      pin: '2222',
       isActive: false,
       adminWhatsapp: '6281234567890',
     },
@@ -120,71 +124,145 @@ export const defaultConfig: AppConfig = {
   },
 };
 
-export const defaultFeedbacks: Feedback[] = [
-  {
-    id: 'fb-1',
-    branchId: 'UTAMA1',
-    rating: 5,
-    message: 'Pelayanan sangat ramah dan tempatnya bersih sekali!',
-    date: new Date(Date.now() - 86400000).toISOString(),
-    status: 'resolved',
-  },
-  {
-    id: 'fb-2',
-    branchId: 'UTAMA1',
-    rating: 2,
-    message: 'Parkiran terlalu sempit dan antrian cukup lama.',
-    date: new Date().toISOString(),
-    status: 'new',
-  },
-];
-
-export const appConfigRef = doc(db, 'app', 'config');
+export const appConfigRef = doc(db, 'app', 'publicConfig');
+export const legacyAppConfigRef = doc(db, 'app', 'config');
 export const feedbackCollectionRef = collection(db, 'feedbacks');
 
-export async function ensureDefaultData(): Promise<void> {
-  const snapshot = await getDoc(appConfigRef);
-  if (!snapshot.exists()) {
-    await setDoc(appConfigRef, defaultConfig);
-  }
+const adminProfilesCollectionRef = collection(db, 'adminUsers');
+
+const normalizeAppConfig = (value: unknown): AppConfig => {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const rawBranches = Array.isArray(raw.branches) ? raw.branches : defaultConfig.branches;
+  const branches = rawBranches.map((value, index) => {
+    const branch = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    const fallback = defaultConfig.branches[index % defaultConfig.branches.length];
+    return {
+      id: typeof branch.id === 'string' ? branch.id : fallback.id,
+      name: typeof branch.name === 'string' ? branch.name : fallback.name,
+      publicAppUrl: typeof branch.publicAppUrl === 'string' ? branch.publicAppUrl : fallback.publicAppUrl,
+      reviewUrl: typeof branch.reviewUrl === 'string' ? branch.reviewUrl : '',
+      qrColor: typeof branch.qrColor === 'string' ? branch.qrColor : fallback.qrColor,
+      qrBgColor: typeof branch.qrBgColor === 'string' ? branch.qrBgColor : fallback.qrBgColor,
+      isActive: typeof branch.isActive === 'boolean' ? branch.isActive : false,
+      adminWhatsapp: typeof branch.adminWhatsapp === 'string' ? branch.adminWhatsapp : fallback.adminWhatsapp,
+    };
+  });
+  const rawPageSettings = raw.pageSettings && typeof raw.pageSettings === 'object'
+    ? raw.pageSettings as Record<string, unknown>
+    : {};
+  const pageSettings = Object.fromEntries(
+    Object.entries(defaultConfig.pageSettings).map(([key, fallback]) => [
+      key,
+      typeof rawPageSettings[key] === 'string' ? rawPageSettings[key] : fallback,
+    ])
+  ) as PageSettings;
+
+  return {
+    branches: branches.length ? branches : defaultConfig.branches,
+    pageSettings,
+  };
+};
+
+export async function migrateLegacyAppConfig(): Promise<void> {
+  if (!isFirebaseReady || !auth.currentUser) throw new Error('Admin authentication is required.');
+
+  await runTransaction(db, async (transaction) => {
+    const [publicSnapshot, legacySnapshot] = await Promise.all([
+      transaction.get(appConfigRef),
+      transaction.get(legacyAppConfigRef),
+    ]);
+
+    const configSource = publicSnapshot.exists()
+      ? publicSnapshot.data()
+      : legacySnapshot.exists()
+        ? legacySnapshot.data()
+        : defaultConfig;
+
+    transaction.set(appConfigRef, normalizeAppConfig(configSource));
+    if (legacySnapshot.exists()) transaction.delete(legacyAppConfigRef);
+  });
 }
 
-export function subscribeAppConfig(callback: (config: AppConfig | null) => void) {
+export function subscribeAppConfig(
+  callback: (config: AppConfig | null) => void,
+  onError?: (error: Error) => void,
+) {
   if (!isFirebaseReady) {
     callback(defaultConfig);
     return () => {};
   }
 
-  return onSnapshot(appConfigRef, (snapshot) => {
-    callback(snapshot.exists() ? (snapshot.data() as AppConfig) : defaultConfig);
-  });
+  return onSnapshot(
+    appConfigRef,
+    (snapshot) => {
+      callback(snapshot.exists() ? normalizeAppConfig(snapshot.data()) : null);
+    },
+    onError,
+  );
 }
 
-export function subscribeFeedbacks(callback: (items: Feedback[]) => void) {
+export function subscribeFeedbacks(
+  callback: (items: Feedback[]) => void,
+  branchId?: string,
+  onError?: (error: Error) => void,
+) {
   if (!isFirebaseReady) {
-    callback(defaultFeedbacks);
+    callback([]);
     return () => {};
   }
 
-  const q = query(feedbackCollectionRef, orderBy('date', 'desc'));
-  return onSnapshot(q, (snapshot) => {
-    const items = snapshot.docs.map((doc) => ({
-      ...(doc.data() as Feedback),
-      id: doc.id,
-    }));
-    callback(items);
-  });
+  const q = branchId
+    ? query(feedbackCollectionRef, where('branchId', '==', branchId))
+    : query(feedbackCollectionRef, orderBy('date', 'desc'));
+
+  return onSnapshot(
+    q,
+    (snapshot) => {
+      const items = snapshot.docs.map((item) => ({
+        ...(item.data() as Feedback),
+        id: item.id,
+      }));
+      items.sort((left, right) => Date.parse(right.date) - Date.parse(left.date));
+      callback(items);
+    },
+    onError,
+  );
+}
+
+export function subscribeAdminProfile(
+  uid: string,
+  callback: (profile: AdminProfile | null) => void,
+  onError?: (error: Error) => void,
+) {
+  if (!isFirebaseReady) {
+    callback(null);
+    return () => {};
+  }
+
+  return onSnapshot(
+    doc(adminProfilesCollectionRef, uid),
+    (snapshot) => {
+      const value = snapshot.data();
+      if (!snapshot.exists() || (value?.role !== 'superadmin' && value?.role !== 'branch_admin')) {
+        callback(null);
+        return;
+      }
+      callback({
+        role: value.role,
+        ...(typeof value.branchId === 'string' ? { branchId: value.branchId } : {}),
+      });
+    },
+    onError,
+  );
 }
 
 export async function saveAppConfig(config: AppConfig): Promise<void> {
-  if (!isFirebaseReady) return;
-  await setDoc(appConfigRef, config);
+  if (!isFirebaseReady || !auth.currentUser) throw new Error('Admin authentication is required.');
+  await setDoc(appConfigRef, normalizeAppConfig(config));
 }
 
 export async function saveFeedback(feedback: Omit<Feedback, 'id'>): Promise<string> {
-  if (!isFirebaseReady) {
-    return `fb-${Date.now()}`;
-  }
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
 
   const docRef = doc(feedbackCollectionRef);
   await setDoc(docRef, {
@@ -196,12 +274,12 @@ export async function saveFeedback(feedback: Omit<Feedback, 'id'>): Promise<stri
   return docRef.id;
 }
 
-export async function updateFeedback(id: string, updates: Partial<Feedback>): Promise<void> {
-  if (!isFirebaseReady) return;
+export async function updateFeedback(id: string, updates: Pick<Feedback, 'status'>): Promise<void> {
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
   await updateDoc(doc(db, 'feedbacks', id), updates);
 }
 
 export async function deleteFeedbackById(id: string): Promise<void> {
-  if (!isFirebaseReady) return;
+  if (!isFirebaseReady) throw new Error('Firebase is not configured.');
   await deleteDoc(doc(db, 'feedbacks', id));
 }

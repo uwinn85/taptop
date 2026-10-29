@@ -1,8 +1,76 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if true;
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function adminProfilePath(uid) {
+      return /databases/$(database)/documents/adminUsers/$(uid);
+    }
+
+    function hasAdminProfile() {
+      return isSignedIn() && exists(adminProfilePath(request.auth.uid));
+    }
+
+    function adminProfile() {
+      return get(adminProfilePath(request.auth.uid)).data;
+    }
+
+    function isSuperadmin() {
+      return hasAdminProfile() && adminProfile().role == 'superadmin';
+    }
+
+    function isBranchAdminFor(branchId) {
+      return hasAdminProfile()
+        && adminProfile().role == 'branch_admin'
+        && adminProfile().branchId == branchId;
+    }
+
+    function isValidFeedback() {
+      return request.resource.data.keys().hasAll(['branchId', 'rating', 'message', 'date', 'status', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['branchId', 'rating', 'message', 'date', 'status', 'createdAt'])
+        && request.resource.data.branchId is string
+        && request.resource.data.branchId.size() > 0
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 4000
+        && request.resource.data.date is string
+        && request.resource.data.date.size() <= 64
+        && request.resource.data.status == 'new'
+        && request.resource.data.createdAt == request.time;
+    }
+
+    match /adminUsers/{uid} {
+      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    match /app/publicConfig {
+      allow read: if true;
+      allow create, update: if isSuperadmin()
+        && request.resource.data.keys().hasOnly(['branches', 'pageSettings'])
+        && request.resource.data.keys().hasAll(['branches', 'pageSettings']);
+      allow delete: if false;
+    }
+
+    match /app/config {
+      allow read, write: if isSuperadmin();
+    }
+
+    match /feedbacks/{feedbackId} {
+      allow create: if isValidFeedback();
+      allow read: if isSuperadmin() || isBranchAdminFor(resource.data.branchId);
+      allow update: if isSuperadmin()
+        || (isBranchAdminFor(resource.data.branchId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+          && request.resource.data.status in ['new', 'resolved']);
+      allow delete: if isSuperadmin() || isBranchAdminFor(resource.data.branchId);
     }
   }
 }
