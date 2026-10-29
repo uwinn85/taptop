@@ -19,6 +19,7 @@ import {
     migrateLegacyAppConfig,
     saveAppConfig,
     saveFeedback,
+    setStoreAccessActive,
     subscribeAdminProfile,
     subscribeAppConfig,
     subscribeFeedbacks,
@@ -28,9 +29,10 @@ import {
     type AppConfig,
     type UserRole,
 } from './firebase';
+import { StoreActivationFlow, StoreReviewsAccess } from './StoreAccessFlow';
 
 // --- TIPE DATA ---
-type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive';
+type ViewState = 'rating' | 'positive' | 'negative' | 'thanks' | 'inactive' | 'activation' | 'store_reviews';
 type AppMode = 'client' | 'admin_login' | 'admin_dashboard';
 type AdminTab = 'qr' | 'page' | 'security' | 'feedback';
 
@@ -46,6 +48,7 @@ interface Feedback {
 interface Branch {
     id: string;
     name: string;
+    activationCode: string;
     publicAppUrl: string;
     reviewUrl: string;
     qrColor: string;
@@ -195,6 +198,7 @@ export default function App() {
         setIsConfigLoading(true);
         return subscribeAppConfig(
             (config) => {
+                console.log('[v0] App config snapshot loaded', { exists: Boolean(config), inactiveBranchIds: JSON.stringify(config?.branches.filter((branch) => !branch.isActive).map((branch) => branch.id) ?? []) });
                 const nextConfig = config ?? defaultConfig;
                 const serializedConfig = config ? serializeAppConfig(config) : null;
                 if (pendingConfigWritesRef.current === 0) {
@@ -211,7 +215,8 @@ export default function App() {
                 setConfigLoadError('');
                 setConfigSyncError('');
             },
-            () => {
+            (error) => {
+                console.log('[v0] App config snapshot failed', { code: (error as { code?: string }).code });
                 setIsConfigLoading(false);
                 setConfigLoadError('Konfigurasi aplikasi gagal dimuat dari Firebase.');
             }
@@ -360,7 +365,7 @@ export default function App() {
     }, []);
 
     const activeBranch = appConfig.branches[selectedBranchIndex] || appConfig.branches[0];
-    const clientBranch = appConfig.branches.find(b => b.id === currentClientBranchId) || appConfig.branches[0];
+    const clientBranch = appConfig.branches.find((branch) => branch.id === currentClientBranchId) ?? null;
 
     useEffect(() => {
         if (adminProfile?.role !== 'branch_admin' || !authUser) return;
@@ -391,12 +396,15 @@ export default function App() {
 
     // --- STATE CLIENT (PENGUNJUNG) ---
     const [view, setView] = useState<ViewState>('rating');
+    const viewRef = useRef(view);
+    viewRef.current = view;
     const [hoveredRating, setHoveredRating] = useState(0);
     const [selectedRating, setSelectedRating] = useState(0);
     const [feedbackText, setFeedbackText] = useState('');
     
     // Cek status keaktifan saat client load
     useEffect(() => {
+        if (viewRef.current === 'activation' || viewRef.current === 'store_reviews') return;
         if (!clientBranch || !clientBranch.isActive) {
             setView('inactive');
         } else {
@@ -458,7 +466,7 @@ export default function App() {
 
     const submitFeedback = async () => {
         const message = feedbackText.trim();
-        if (!message || isSubmittingFeedback) return;
+        if (!clientBranch || !message || isSubmittingFeedback) return;
         if (!isFirebaseReady) {
             setFeedbackSubmitError('Firebase belum dikonfigurasi, jadi ulasan belum dapat disimpan.');
             return;
@@ -475,7 +483,7 @@ export default function App() {
         setFeedbackSubmitError('');
         setIsSubmittingFeedback(true);
         try {
-            const id = await saveFeedback(feedbackData);
+            const id = await saveFeedback(feedbackData, Boolean(clientBranch.activationCode && clientBranch.isActive));
             const newFeedback: Feedback = { ...feedbackData, id };
             setFeedbacks((current) => current.some((item) => item.id === id) ? current : [newFeedback, ...current]);
             setFeedbackText('');
@@ -500,7 +508,7 @@ export default function App() {
     };
 
     const goToGoogleReview = () => {
-        window.open(clientBranch.reviewUrl, '_blank');
+        if (clientBranch?.reviewUrl) window.open(clientBranch.reviewUrl, '_blank', 'noopener,noreferrer');
     };
 
     // Fungsi animasi pesta (confetti)
@@ -570,6 +578,7 @@ export default function App() {
             id: randomId,
             name: `Toko ${randomId}`,
             publicAppUrl: `https://toko-anda.com/feedback?branch=${randomId}`,
+            activationCode: "",
             reviewUrl: "",
             qrColor: "#4F46E5",
             qrBgColor: "#FFFFFF",
@@ -607,6 +616,7 @@ export default function App() {
             const newBranch: Branch = {
                 id: randomId,
                 name: `Toko ${randomId}`,
+                activationCode: "",
                 publicAppUrl: `https://toko-anda.com/feedback?branch=${randomId}`,
                 reviewUrl: "",
                 qrColor: "#4F46E5",
@@ -627,6 +637,10 @@ export default function App() {
             alert('Harus ada minimal 1 cabang!');
             return;
         }
+        const branchToDelete = appConfig.branches[index];
+        if (branchToDelete.activationCode) {
+            void setStoreAccessActive(branchToDelete.id, false).catch(() => setConfigSyncError('Akses toko gagal dinonaktifkan di Firebase.'));
+        }
         const newBranches = appConfig.branches.filter((_, i) => i !== index);
         setAppConfig({ ...appConfig, branches: newBranches });
         setSelectedBranchIndex(0);
@@ -646,6 +660,9 @@ export default function App() {
 
         newBranches[index] = { ...newBranches[index], [field]: processedValue };
         setAppConfig({ ...appConfig, branches: newBranches });
+        if (field === 'isActive' && newBranches[index].activationCode && typeof processedValue === 'boolean') {
+            void setStoreAccessActive(newBranches[index].id, processedValue).catch(() => setConfigSyncError('Status akses PIN toko gagal diperbarui di Firebase.'));
+        }
     };
 
     const updatePageSetting = (field: keyof PageSettings, value: string) => {
@@ -891,7 +908,9 @@ export default function App() {
                                                     type="text" 
                                                     value={branch.id} 
                                                     onChange={(e) => updateBranchAtIndex(index, 'id', e.target.value)}
-                                                    className="w-28 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded px-2 py-1 font-mono text-xs uppercase"
+                                                    readOnly={Boolean(branch.activationCode)}
+                                                    title={branch.activationCode ? 'ID cabang terkunci setelah aktivasi' : undefined}
+                                                    className="w-28 bg-gray-50 dark:bg-slate-900 border border-gray-200 dark:border-slate-700 rounded px-2 py-1 font-mono text-xs uppercase read-only:opacity-70"
                                                 />
                                             </td>
                                             <td className="py-3 px-4 font-medium">
@@ -1362,42 +1381,71 @@ export default function App() {
     const renderClient = () => (
         <div className={`w-full max-w-md rounded-3xl p-6 sm:p-8 text-center relative overflow-hidden transition-all duration-500 ${isDarkMode ? 'bg-slate-800/90 text-white shadow-xl shadow-black/50 border border-slate-700/50' : 'bg-white/95 backdrop-blur-md text-gray-800 shadow-2xl border border-white'} animate-in zoom-in-95`}>
             
-            {view === 'inactive' && (
+            {view === 'inactive' && clientBranch && (
                 <div className="animate-in fade-in duration-500 py-2">
-                    <div className="w-16 h-16 sm:w-20 sm:h-20 mx-auto bg-orange-100 dark:bg-orange-900/40 rounded-full flex items-center justify-center shadow-lg mb-4 sm:mb-6">
-                        <AlertTriangle className="w-8 h-8 sm:w-10 sm:h-10 text-orange-500 dark:text-orange-400" />
+                    <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-orange-100 shadow-lg dark:bg-orange-900/40 sm:mb-6 sm:h-20 sm:w-20">
+                        <AlertTriangle className="h-8 w-8 text-orange-500 dark:text-orange-400 sm:h-10 sm:w-10" aria-hidden="true" />
                     </div>
-                    <h1 className="text-xl sm:text-2xl font-bold mb-2">Kartu Belum Aktif</h1>
-                    <p className="text-gray-500 dark:text-gray-400 mb-6 text-xs sm:text-sm leading-relaxed">
-                        QR Code untuk toko <span className="font-semibold text-gray-700 dark:text-gray-200">{clientBranch ? clientBranch.name : currentClientBranchId}</span> belum diaktifkan.
+                    <h1 className="mb-2 text-xl font-bold sm:text-2xl">Kartu Belum Aktif</h1>
+                    <p className="mb-6 text-xs leading-relaxed text-gray-500 dark:text-gray-400 sm:text-sm">
+                        Kartu untuk toko <span className="font-semibold text-gray-700 dark:text-gray-200">{clientBranch.name}</span> belum aktif.
                     </p>
 
                     <div className="space-y-3">
-                        <p className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-xs leading-relaxed text-orange-800 dark:border-orange-900/50 dark:bg-orange-900/20 dark:text-orange-300">
-                            Kartu ini hanya dapat diaktifkan oleh superadmin melalui dashboard. Hubungi admin untuk meminta aktivasi.
+                        <p className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-left text-xs leading-relaxed text-orange-800 dark:border-orange-900/50 dark:bg-orange-900/20 dark:text-orange-300">
+                            Superadmin dapat mengaktifkan kartu di sini dengan mengisi data toko dan memverifikasi akun admin.
                         </p>
-                        <a 
-                            href={`https://wa.me/${clientBranch ? clientBranch.adminWhatsapp : '6281234567890'}?text=Halo%20Admin,%20saya%20ingin%20mengaktifkan%20kartu%20QR%20untuk%20toko%20ID:%20${currentClientBranchId}`}
+                        <button
+                            type="button"
+                            onClick={() => setView('activation')}
+                            disabled={!hasLoadedConfig || Boolean(configLoadError)}
+                            className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3 text-xs font-semibold text-white shadow-md transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50 sm:text-sm"
+                        >
+                            <KeyRound className="h-4 w-4" aria-hidden="true" /> Aktifkan kartu
+                        </button>
+                        <a
+                            href={`https://wa.me/${clientBranch.adminWhatsapp}?text=${encodeURIComponent(`Halo Admin, saya ingin mengaktifkan kartu toko ID: ${currentClientBranchId}`)}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 px-6 rounded-xl transition-all shadow-md flex items-center justify-center gap-2 text-xs sm:text-sm"
+                            className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-6 py-3 text-xs font-semibold text-white shadow-md transition hover:bg-emerald-700 sm:text-sm"
                         >
-                            <PhoneCall className="w-4 h-4" /> Hubungi Admin (WhatsApp)
+                            <PhoneCall className="h-4 w-4" aria-hidden="true" /> Hubungi Admin (WhatsApp)
                         </a>
-
-                        <button 
+                        <button
                             type="button"
                             onClick={() => {
-                                navigator.clipboard.writeText(`${window.location.origin}${window.location.pathname}?branch=${currentClientBranchId}`);
-                                alert('URL Landing Page berhasil disalin!');
+                                void navigator.clipboard.writeText(`${window.location.origin}${window.location.pathname}?branch=${encodeURIComponent(currentClientBranchId)}`);
                             }}
-                            className="w-full bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 font-medium py-2.5 px-6 rounded-xl transition-all flex items-center justify-center gap-2 text-xs sm:text-sm"
+                            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gray-100 px-6 py-2.5 text-xs font-medium text-gray-700 transition hover:bg-gray-200 dark:bg-slate-700 dark:text-gray-200 dark:hover:bg-slate-600 sm:text-sm"
                         >
-                            <LinkIcon className="w-4 h-4" /> Salin URL Landing Page
+                            <LinkIcon className="h-4 w-4" aria-hidden="true" /> Salin URL Landing Page
                         </button>
                     </div>
-
                 </div>
+            )}
+
+            {view === 'inactive' && !clientBranch && (
+                <div className="py-8">
+                    <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-orange-100 text-orange-600 dark:bg-orange-900/40 dark:text-orange-300">
+                        <AlertTriangle className="h-7 w-7" aria-hidden="true" />
+                    </div>
+                    <h1 className="text-xl font-bold">Kartu tidak ditemukan</h1>
+                    <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">Tautan QR tidak mengarah ke toko yang terdaftar.</p>
+                </div>
+            )}
+
+            {view === 'activation' && clientBranch && (
+                <StoreActivationFlow
+                    branch={clientBranch}
+                    appConfig={appConfig}
+                    isConfigReady={hasLoadedConfig && !isConfigLoading && !configLoadError}
+                    onConfigActivated={setAppConfig}
+                    onCancel={() => setView(clientBranch.isActive ? 'rating' : 'inactive')}
+                />
+            )}
+
+            {view === 'store_reviews' && clientBranch && (
+                <StoreReviewsAccess branch={clientBranch} onClose={resetClientView} />
             )}
 
             {view === 'rating' && clientBranch && (
@@ -1429,6 +1477,11 @@ export default function App() {
                     <p className="text-xs sm:text-sm font-medium text-indigo-600 dark:text-indigo-400 h-6">
                         {ratingDescriptions[hoveredRating || selectedRating]}
                     </p>
+                    {clientBranch.activationCode && (
+                        <button type="button" onClick={() => setView('store_reviews')} className="mt-5 inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white/80 px-4 py-2.5 text-xs font-semibold text-slate-600 transition hover:border-indigo-300 hover:text-indigo-700 dark:border-slate-700 dark:bg-slate-900/70 dark:text-slate-300 dark:hover:border-indigo-700 dark:hover:text-indigo-300">
+                            <KeyRound className="h-4 w-4" aria-hidden="true" /> Akses pemilik toko · Lihat ulasan
+                        </button>
+                    )}
                 </div>
             )}
 

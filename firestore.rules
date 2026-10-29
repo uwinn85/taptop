@@ -28,6 +28,37 @@ service cloud.firestore {
         && adminProfile().branchId == branchId;
     }
 
+    function storeAccessPath(branchId) {
+      return /databases/$(database)/documents/storeAccess/$(branchId);
+    }
+
+    function isActiveStoreAccess(branchId) {
+      return exists(storeAccessPath(branchId))
+        && get(storeAccessPath(branchId)).data.active == true;
+    }
+
+    function isStoreUserFor(branchId) {
+      return isSignedIn()
+        && isActiveStoreAccess(branchId)
+        && get(storeAccessPath(branchId)).data.authUid == request.auth.uid;
+    }
+
+    function isValidStoreReview(branchId) {
+      return request.auth == null
+        && request.resource.data.keys().hasAll(['branchId', 'rating', 'message', 'date', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['branchId', 'rating', 'message', 'date', 'createdAt'])
+        && request.resource.data.branchId == branchId
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 4000
+        && request.resource.data.date is string
+        && request.resource.data.date.size() <= 64
+        && request.resource.data.createdAt == request.time;
+    }
+
     function isValidFeedback() {
       return request.resource.data.keys().hasAll(['branchId', 'rating', 'message', 'date', 'status', 'createdAt'])
         && request.resource.data.keys().hasOnly(['branchId', 'rating', 'message', 'date', 'status', 'createdAt'])
@@ -71,6 +102,19 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
           && request.resource.data.status in ['new', 'resolved']);
       allow delete: if isSuperadmin() || isBranchAdminFor(resource.data.branchId);
+    }
+
+    match /storeAccess/{branchId} {
+      allow get: if isSuperadmin() || (isSignedIn() && resource.data.authUid == request.auth.uid);
+      allow list: if isSuperadmin();
+      allow create, update, delete: if isSuperadmin();
+
+      match /reviews/{reviewId} {
+        allow read: if isSuperadmin() || isBranchAdminFor(branchId) || isStoreUserFor(branchId);
+        allow create: if isSuperadmin() || isBranchAdminFor(branchId)
+          || (isActiveStoreAccess(branchId) && isValidStoreReview(branchId));
+        allow update, delete: if isSuperadmin() || isBranchAdminFor(branchId);
+      }
     }
   }
 }
