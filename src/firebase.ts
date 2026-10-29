@@ -167,16 +167,11 @@ export async function migrateLegacyAppConfig(): Promise<void> {
   if (!isFirebaseReady || !auth.currentUser) throw new Error('Admin authentication is required.');
 
   await runTransaction(db, async (transaction) => {
-    const [publicSnapshot, legacySnapshot] = await Promise.all([
-      transaction.get(appConfigRef),
-      transaction.get(legacyAppConfigRef),
-    ]);
+    const publicSnapshot = await transaction.get(appConfigRef);
+    if (publicSnapshot.exists()) return;
 
-    const configSource = publicSnapshot.exists()
-      ? publicSnapshot.data()
-      : legacySnapshot.exists()
-        ? legacySnapshot.data()
-        : defaultConfig;
+    const legacySnapshot = await transaction.get(legacyAppConfigRef);
+    const configSource = legacySnapshot.exists() ? legacySnapshot.data() : defaultConfig;
 
     transaction.set(appConfigRef, normalizeAppConfig(configSource));
     if (legacySnapshot.exists()) transaction.delete(legacyAppConfigRef);

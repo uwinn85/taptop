@@ -96,6 +96,18 @@ const getLoginErrorMessage = (error: unknown): string => {
     return 'Tidak dapat masuk. Periksa konfigurasi Firebase dan coba lagi.';
 };
 
+const getConfigPreparationErrorMessage = (error: unknown): string => {
+    const code = (error as { code?: string } | null)?.code;
+    if (code === 'permission-denied') {
+        return 'Firestore menolak persiapan konfigurasi (permission-denied). Publikasikan Rules terbaru; superadmin perlu akses tulis ke app/publicConfig dan akses baca/tulis ke app/config hanya untuk migrasi lama.';
+    }
+    if (code === 'unavailable' || code === 'deadline-exceeded') {
+        return 'Firestore tidak dapat dijangkau. Periksa koneksi lalu masuk kembali.';
+    }
+    if (code) return `Konfigurasi Firebase gagal disiapkan (${code}). Periksa Firestore Rules.`;
+    return 'Konfigurasi Firebase gagal disiapkan. Periksa Firestore Rules, lalu keluar dan masuk kembali.';
+};
+
 export default function App() {
     // --- STATE THEME ---
     const [isDarkMode, setIsDarkMode] = useState(false);
@@ -294,14 +306,14 @@ export default function App() {
                         setAppMode('admin_dashboard');
                         setIsAuthLoading(false);
                         setIsAuthenticating(false);
-                    }).catch(() => {
+                    }).catch((error: unknown) => {
                         adminMigrationUidRef.current = null;
                         adminMigrationStatusRef.current = 'idle';
                         setIsAdminConfigReady(false);
                         setIsAuthLoading(false);
                         setIsAuthenticating(false);
                         setAppMode('admin_login');
-                        setLoginError('Konfigurasi Firebase gagal disiapkan. Periksa Firestore Rules, lalu keluar dan masuk kembali.');
+                        setLoginError(getConfigPreparationErrorMessage(error));
                     });
                 },
                 () => {
